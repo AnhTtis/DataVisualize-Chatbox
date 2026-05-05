@@ -1,0 +1,240 @@
+{
+  "combo_name": "Combo_4",
+  "model_name": "Random Forest Regressor",
+  "target_transform": "log1p(unit_price_trieu_m2) -> predicted_price = unit_price * area * 1_000_000",
+  "feature_list": [
+    "Đường",
+    "Huyện/Quận cũ",
+    "Tỉnh/Thành phố cũ",
+    "Loại hình",
+    "Diện tích",
+    "Số phòng ngủ",
+    "Số phòng vệ sinh",
+    "Loại hình nhà ở",
+    "Loại hình căn hộ",
+    "Loại hình đất",
+    "Loại hình văn phòng"
+  ],
+  "metrics": {
+    "MAE (bn VND)": 1.9242726211621946,
+    "RMSLE": 0.4404855290243861,
+    "Hit <= 0.5 bn (%)": 39.23982869379015,
+    "Hit <= 10% (%)": 35.36759457530336,
+    "Hit <= 20% (%)": 58.6366880799429
+  },
+  "rows": 37359,
+  "train_rows": 31755,
+  "test_rows": 5604,
+  "property_type_column": "Loại hình",
+  "property_type_models": {
+    "Căn hộ/Chung cư": {
+      "best_model_name": "Random Forest Regressor",
+      "selected_model_name": "Random Forest Regressor",
+      "selected_source": "all_model",
+      "metrics": {
+        "MAE (bn VND)": 0.6525411988422595,
+        "RMSLE": 0.3709224617779586,
+        "Hit <= 0.5 bn (%)": 66.81818181818183,
+        "Hit <= 10% (%)": 52.27272727272727,
+        "Hit <= 20% (%)": 72.72727272727273
+      },
+      "rows": 5783,
+      "train_rows": 4903,
+      "test_rows": 880,
+      "type_specific_model_name": "Random Forest Regressor",
+      "type_specific_metrics": {
+        "MAE (bn VND)": 0.6562545967795148,
+        "RMSLE": 0.37256423585980486,
+        "Hit <= 0.5 bn (%)": 67.61363636363636,
+        "Hit <= 10% (%)": 53.86363636363637,
+        "Hit <= 20% (%)": 73.86363636363636
+      },
+      "all_model_name": "Random Forest Regressor",
+      "all_model_metrics": {
+        "MAE (bn VND)": 0.6525411988422595,
+        "RMSLE": 0.3709224617779586,
+        "Hit <= 0.5 bn (%)": 66.81818181818183,
+        "Hit <= 10% (%)": 52.27272727272727,
+        "Hit <= 20% (%)": 72.72727272727273
+      }
+    },
+    "Nhà ở": {
+      "best_model_name": "Random Forest Regressor",
+      "selected_model_name": "Random Forest Regressor",
+      "selected_source": "all_model",
+      "metrics": {
+        "MAE (bn VND)": 1.5418586309934907,
+        "RMSLE": 0.3155685199398575,
+        "Hit <= 0.5 bn (%)": 35.4422964264792,
+        "Hit <= 10% (%)": 35.6473345049795,
+        "Hit <= 20% (%)": 61.36496777973052
+      },
+      "rows": 22695,
+      "train_rows": 19281,
+      "test_rows": 3414,
+      "type_specific_model_name": "Random Forest Regressor",
+      "type_specific_metrics": {
+        "MAE (bn VND)": 1.562996866521199,
+        "RMSLE": 0.3168184062072932,
+        "Hit <= 0.5 bn (%)": 35.26654950205038,
+        "Hit <= 10% (%)": 36.057410661980086,
+        "Hit <= 20% (%)": 61.072056239015815
+      },
+      "all_model_name": "Random Forest Regressor",
+      "all_model_metrics": {
+        "MAE (bn VND)": 1.5418586309934907,
+        "RMSLE": 0.3155685199398575,
+        "Hit <= 0.5 bn (%)": 35.4422964264792,
+        "Hit <= 10% (%)": 35.6473345049795,
+        "Hit <= 20% (%)": 61.36496777973052
+      }
+    },
+    "Văn phòng, Mặt bằng kinh doanh": {
+      "best_model_name": "Random Forest Regressor",
+      "selected_model_name": "Random Forest Regressor",
+      "selected_source": "type_specific",
+      "metrics": {
+        "MAE (bn VND)": 8.398954738099302,
+        "RMSLE": 1.6816237039850623,
+        "Hit <= 0.5 bn (%)": 11.11111111111111,
+        "Hit <= 10% (%)": 6.349206349206349,
+        "Hit <= 20% (%)": 17.46031746031746
+      },
+      "rows": 473,
+      "train_rows": 410,
+      "test_rows": 63,
+      "type_specific_model_name": "Random Forest Regressor",
+      "type_specific_metrics": {
+        "MAE (bn VND)": 8.398954738099302,
+        "RMSLE": 1.6816237039850623,
+        "Hit <= 0.5 bn (%)": 11.11111111111111,
+        "Hit <= 10% (%)": 6.349206349206349,
+        "Hit <= 20% (%)": 17.46031746031746
+      },
+      "all_model_name": "Random Forest Regressor",
+      "all_model_metrics": {
+        "MAE (bn VND)": 9.110951874071732,
+        "RMSLE": 1.695573555796815,
+        "Hit <= 0.5 bn (%)": 6.349206349206349,
+        "Hit <= 10% (%)": 3.1746031746031744,
+        "Hit <= 20% (%)": 15.873015873015872
+      }
+    },
+    "Đất": {
+      "best_model_name": "XGBoost Regressor",
+      "selected_model_name": "XGBoost Regressor",
+      "selected_source": "type_specific",
+      "metrics": {
+        "MAE (bn VND)": 3.4209744158629585,
+        "RMSLE": 0.5977224498055043,
+        "Hit <= 0.5 bn (%)": 27.666399358460303,
+        "Hit <= 10% (%)": 18.68484362469928,
+        "Hit <= 20% (%)": 38.25180433039294
+      },
+      "rows": 8408,
+      "train_rows": 7161,
+      "test_rows": 1247,
+      "type_specific_model_name": "XGBoost Regressor",
+      "type_specific_metrics": {
+        "MAE (bn VND)": 3.4209744158629585,
+        "RMSLE": 0.5977224498055043,
+        "Hit <= 0.5 bn (%)": 27.666399358460303,
+        "Hit <= 10% (%)": 18.68484362469928,
+        "Hit <= 20% (%)": 38.25180433039294
+      },
+      "all_model_name": "Random Forest Regressor",
+      "all_model_metrics": {
+        "MAE (bn VND)": 3.5056072010693278,
+        "RMSLE": 0.5974790220487738,
+        "Hit <= 0.5 bn (%)": 31.836407377706493,
+        "Hit <= 10% (%)": 24.29831595829992,
+        "Hit <= 20% (%)": 43.3841218925421
+      }
+    }
+  },
+  "min_samples_per_type": 300,
+  "coordinate_fill_stats": {
+    "missing_coordinates_before": 30,
+    "missing_coordinates_after_geocode": 30,
+    "missing_coordinates_after_fill": 0
+  },
+  "geocode_enabled": false,
+  "google_geocode_configured": false,
+  "random_state": 42,
+  "test_size": 0.15,
+  "target_mode": "unit_price_times_area",
+  "unit_price_scale": 1000000.0,
+  "benchmark_path": "artifacts\\combo4_unit_price_benchmark.csv",
+  "top_models": [
+    {
+      "Property Type": "ALL",
+      "Rows": 37359,
+      "Train Rows": 31755,
+      "Test Rows": 5604,
+      "Model": "Random Forest Regressor",
+      "Source": "type_specific",
+      "Target": "Đơn giá x Diện tích",
+      "MAE (bn VND)": 1.9242726211621946,
+      "RMSLE": 0.4404855290243861,
+      "Hit <= 0.5 bn (%)": 39.23982869379015,
+      "Hit <= 10% (%)": 35.36759457530336,
+      "Hit <= 20% (%)": 58.6366880799429
+    },
+    {
+      "Property Type": "ALL",
+      "Rows": 37359,
+      "Train Rows": 31755,
+      "Test Rows": 5604,
+      "Model": "LightGBM Regressor",
+      "Source": "type_specific",
+      "Target": "Đơn giá x Diện tích",
+      "MAE (bn VND)": 2.0301486077926834,
+      "RMSLE": 0.4490831110498042,
+      "Hit <= 0.5 bn (%)": 32.815845824411134,
+      "Hit <= 10% (%)": 28.533190578158457,
+      "Hit <= 20% (%)": 53.78301213418987
+    },
+    {
+      "Property Type": "ALL",
+      "Rows": 37359,
+      "Train Rows": 31755,
+      "Test Rows": 5604,
+      "Model": "XGBoost Regressor",
+      "Source": "type_specific",
+      "Target": "Đơn giá x Diện tích",
+      "MAE (bn VND)": 2.084097471893877,
+      "RMSLE": 0.45304103795330314,
+      "Hit <= 0.5 bn (%)": 31.29907209136331,
+      "Hit <= 10% (%)": 26.837972876516776,
+      "Hit <= 20% (%)": 51.69521770164168
+    },
+    {
+      "Property Type": "Căn hộ/Chung cư",
+      "Rows": 5783,
+      "Train Rows": 4903,
+      "Test Rows": 880,
+      "Model": "Random Forest Regressor",
+      "Source": "all_model",
+      "Target": "Đơn giá x Diện tích",
+      "MAE (bn VND)": 0.6525411988422595,
+      "RMSLE": 0.3709224617779586,
+      "Hit <= 0.5 bn (%)": 66.81818181818183,
+      "Hit <= 10% (%)": 52.27272727272727,
+      "Hit <= 20% (%)": 72.72727272727273
+    },
+    {
+      "Property Type": "Căn hộ/Chung cư",
+      "Rows": 5783,
+      "Train Rows": 4903,
+      "Test Rows": 880,
+      "Model": "Random Forest Regressor",
+      "Source": "type_specific",
+      "Target": "Đơn giá x Diện tích",
+      "MAE (bn VND)": 0.6562545967795148,
+      "RMSLE": 0.37256423585980486,
+      "Hit <= 0.5 bn (%)": 67.61363636363636,
+      "Hit <= 10% (%)": 53.86363636363637,
+      "Hit <= 20% (%)": 73.86363636363636
+    }
+  ]
+}
