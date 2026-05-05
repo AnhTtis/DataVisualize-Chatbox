@@ -19,6 +19,11 @@ This is a Gradio demo with:
    ```bash
    python app.py
    ```
+   Or:
+   ```bash
+   python -m app
+   ```
+   Do not use `python -m app.py`; Python treats `app.py` as a module path there and it fails.
 
 ## Notes
 

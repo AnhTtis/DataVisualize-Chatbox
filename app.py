@@ -2,7 +2,7 @@ import io
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
@@ -30,7 +30,11 @@ ALLOWED_UPLOAD_EXTS = [".txt", ".pdf", ".csv", ".doc", ".docx", ".png", ".jpg", 
 
 
 def now_ts() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def utc_timestamp() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
 
 
 class FirebaseStore:
@@ -184,7 +188,7 @@ store = FirebaseStore()
 
 
 def init_state() -> Dict[str, Any]:
-    thread_id = f"thread-{int(datetime.utcnow().timestamp())}"
+    thread_id = f"thread-{utc_timestamp()}"
     return {
         "threads": {
             thread_id: {
@@ -244,7 +248,7 @@ def new_thread(
     state: Dict[str, Any],
     config: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], gr.Dropdown, List[Dict[str, str]], str, str, str, Optional[str], str, str]:
-    thread_id = f"thread-{int(datetime.utcnow().timestamp())}"
+    thread_id = f"thread-{utc_timestamp()}"
     state["threads"][thread_id] = {
         "title": f"Chat {len(state['order']) + 1}",
         "messages": [],

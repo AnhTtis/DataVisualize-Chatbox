@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import traceback
+import warnings
 from pathlib import Path
 
 import gradio as gr
@@ -121,7 +122,14 @@ def load_artifact():
             "Model artifact was not downloaded. The file in artifacts is still a Git LFS pointer."
         )
 
-    return joblib.load(MODEL_PATH)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*If you are loading a serialized model.*",
+            category=UserWarning,
+            module=r"xgboost\.core",
+        )
+        return joblib.load(MODEL_PATH)
 
 
 def load_raw_address_data():
