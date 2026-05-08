@@ -226,6 +226,12 @@ def render_prompt(config: Dict[str, Any], knowledge_base_context: str = "") -> s
     parts.append(
         "Generated Python code can call `list_kb_collections()` to see configured MongoDB collection names."
     )
+    parts.append(
+        "When plotting, prefer the provided `plt` object instead of importing matplotlib manually inside the generated code."
+    )
+    parts.append(
+        "The execution environment already provides common aliases like `np`, `pd`, `re`, `os`, `json`, `math`, and `Path`."
+    )
     if knowledge_base_context:
         parts.append("Knowledge Base Context:")
         parts.append(knowledge_base_context)
@@ -287,6 +293,114 @@ def list_kb_collections() -> List[str]:
     return knowledge_base._parse_collection_names(DEFAULT_MONGODB_COLLECTION_NAME)
 
 
+def code_requests_plotting(code: str) -> bool:
+    lowered = (code or "").lower()
+    plot_markers = [
+        "matplotlib",
+        "plt.",
+        "pyplot",
+        "seaborn",
+        "sns.",
+        ".plot(",
+        ".hist(",
+        ".bar(",
+        ".scatter(",
+        ".line(",
+        ".boxplot(",
+    ]
+    return any(marker in lowered for marker in plot_markers)
+
+
+class MatplotlibUnavailableProxy:
+    def __init__(self, error_message: str) -> None:
+        self.error_message = error_message
+
+    def __getattr__(self, name: str):
+        raise RuntimeError(self.error_message)
+
+
+def load_matplotlib_pyplot() -> Tuple[Optional[Any], str]:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt, ""
+    except Exception as exc:
+        guidance = (
+            "Matplotlib is unavailable in the local Python environment. "
+            "Text/data code can still run, but chart rendering needs a working matplotlib install. "
+            f"Original import error: {exc}"
+        )
+        return None, guidance
+
+
+def load_optional_alias(module_name: str, package_name: Optional[str] = None) -> Any:
+    try:
+        return __import__(module_name, fromlist=["*"])
+    except Exception:
+        if package_name:
+            try:
+                __import__(package_name)
+                return __import__(module_name, fromlist=["*"])
+            except Exception:
+                return None
+        return None
+
+
+def build_exec_globals(code: str) -> Dict[str, Any]:
+    import csv
+    import datetime as dt
+    import io as stdlib_io
+    import json
+    import math
+    import os as stdlib_os
+    import random
+    import re as stdlib_re
+    import statistics
+    import textwrap
+    from collections import Counter, defaultdict
+    from pathlib import Path as StdlibPath
+
+    import numpy as np
+    import pandas as pd
+
+    plot_requested = code_requests_plotting(code)
+    plt, matplotlib_error = load_matplotlib_pyplot() if plot_requested else (None, "")
+    if plt is None:
+        plt_global: Any = MatplotlibUnavailableProxy(matplotlib_error) if plot_requested else None
+    else:
+        plt_global = plt
+
+    sns = load_optional_alias("seaborn")
+    px = load_optional_alias("plotly.express", "plotly")
+    go = load_optional_alias("plotly.graph_objects", "plotly")
+
+    return {
+        "np": np,
+        "pd": pd,
+        "plt": plt_global,
+        "sns": sns,
+        "px": px,
+        "go": go,
+        "os": stdlib_os,
+        "re": stdlib_re,
+        "json": json,
+        "math": math,
+        "random": random,
+        "statistics": statistics,
+        "textwrap": textwrap,
+        "csv": csv,
+        "io": stdlib_io,
+        "datetime": dt,
+        "Path": StdlibPath,
+        "Counter": Counter,
+        "defaultdict": defaultdict,
+        "load_kb_collection": load_kb_collection,
+        "get_kb_collection_schema": get_kb_collection_schema,
+        "list_kb_collections": list_kb_collections,
+    }
+
+
 def run_code(code: str) -> Tuple[str, Optional[str]]:
     stdout_buffer = io.StringIO()
     image_path = None
@@ -294,16 +408,8 @@ def run_code(code: str) -> Tuple[str, Optional[str]]:
     # Demo-only execution. Use a sandbox for production.
     try:
         import sys
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        exec_globals = {
-            "plt": plt,
-            "load_kb_collection": load_kb_collection,
-            "get_kb_collection_schema": get_kb_collection_schema,
-            "list_kb_collections": list_kb_collections,
-        }
+        exec_globals = build_exec_globals(code)
+        plt = exec_globals.get("plt")
 
         def try_exec() -> None:
             exec(code, exec_globals, local_env)
@@ -323,9 +429,18 @@ def run_code(code: str) -> Tuple[str, Optional[str]]:
                 raise
             install_module(missing)
             try_exec()
+        except ImportError as exc:
+            if "_c_internal_utils" in str(exc) or "matplotlib" in str(exc).lower():
+                return (
+                    "Execution error: Matplotlib could not be imported in the local Python environment. "
+                    "Non-chart code can still run, but chart code needs a working matplotlib install. "
+                    f"Original error: {exc}",
+                    None,
+                )
+            raise
         sys.stdout = old_stdout
 
-        if plt.get_fignums():
+        if plt is not None and plt.get_fignums():
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             plt.savefig(tmp.name)
             image_path = tmp.name
