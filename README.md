@@ -27,7 +27,7 @@ This is a Gradio demo with:
 
 ## Knowledge Base Setup
 
-The app scans all documents across all collections when searching the Knowledge Base. To ensure fast and reliable retrieval:
+The app can preload documents across configured collections, rank them by relevance for each query, and send only the top matches to the model. To ensure fast and reliable retrieval:
 
 1. Index creation
 
@@ -43,33 +43,35 @@ The app scans all documents across all collections when searching the Knowledge 
    ```
 
 3. The Knowledge Base will:
-   - Scan all documents in all specified collections (the app preloads documents at startup)
+   - Optionally preload all documents in all specified collections at startup
    - Search multiple collections in parallel for speed
-   - Internal ranking considers all documents; the chat prompt includes the top 5 matches by default
+   - Rank documents by relevance and include only the top matches in the chat prompt
+   - Add collection overview context when a question explicitly targets a whole collection such as `House`
    - Provide answers even when the Knowledge Base has no matching documents
 
 ### Performance Tuning (Optional)
 
 If needed, customize in `.env`:
 ```
-KB_TOP_RESULTS=5                  # Number of KB results to include in prompt
-KB_SNIPPET_LIMIT=150              # Max characters per snippet (affects display)
+KB_RESULT_LIMIT=5                 # Number of KB results to include in prompt
+KB_SNIPPET_LIMIT=300             # Max characters per snippet (affects display)
 KB_TEXT_LIMIT=2000                # Max characters to extract from each document
 KB_LIST_ITEMS_LIMIT=10            # Max nested array items to process
-KB_SEARCH_TIMEOUT_SECONDS=30      # Max time for KB search operation
+KB_PRELOAD=1                      # Preload documents into memory at startup
+KB_INCLUDE_ALL_DOCS_IN_PROMPT=0   # Force legacy full-KB prompt mode
+KB_COLLECTION_FIELD_LIMIT=40      # Max fields to show in collection overview context
+FIRESTORE_TRUNCATE_EVENT_PAYLOAD=0 # Keep full event logs; set to 1 only if you need truncation
 KB_ENABLE_TIMING_LOGS=1           # Log search performance metrics
 ```
 
 Performance metrics are printed to console when `KB_ENABLE_TIMING_LOGS=1`:
-```
-[KB TIMING] search (text index): 156.2ms (found=12, display=5)
-[KB TIMING] _search_by_scan: 234.5ms (scanned=5000, results=12)
-```
+`[KB TIMING] search: 156.2ms (returned=5)`
 
 ### Notes
 
 - Firebase storage uses a service account JSON in `FIREBASE_CREDENTIALS_JSON`.
-- Knowledge Base scans all documents across all specified collections. Use `create_kb_index.py` to create text indexes for faster retrieval.
+- Knowledge Base can preload documents across all specified collections, but only top-ranked results are added to the prompt by default.
+- Generated Python code can use `load_kb_collection("House")`, `get_kb_collection_schema("House")`, and `list_kb_collections()` for collection-wide analysis and charts.
 - Set `MONGODB_DB_NAME` and `MONGODB_COLLECTION_NAME` in `.env` before using the Knowledge Base.
 
  - Firebase storage uses a service account JSON in `FIREBASE_CREDENTIALS_JSON`.

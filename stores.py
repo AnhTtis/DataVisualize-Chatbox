@@ -2,6 +2,8 @@ import os
 import re
 import time
 import traceback
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -20,7 +22,43 @@ KB_LIST_ITEMS_LIMIT = int(os.getenv("KB_LIST_ITEMS_LIMIT", "10"))
 KB_ENABLE_TIMING_LOGS = os.getenv("KB_ENABLE_TIMING_LOGS", "1") == "1"
 KB_PRELOAD = os.getenv("KB_PRELOAD", "1") == "1"
 KB_CREATE_INDEX = os.getenv("KB_CREATE_INDEX", "1") == "1"
-KB_INCLUDE_ALL_DOCS_IN_PROMPT = os.getenv("KB_INCLUDE_ALL_DOCS_IN_PROMPT", "1") == "1"
+KB_INCLUDE_ALL_DOCS_IN_PROMPT = os.getenv("KB_INCLUDE_ALL_DOCS_IN_PROMPT", "0") == "1"
+KB_RESULT_LIMIT = max(1, int(os.getenv("KB_RESULT_LIMIT", "5")))
+KB_SNIPPET_LIMIT = max(120, int(os.getenv("KB_SNIPPET_LIMIT", "300")))
+KB_COLLECTION_FIELD_LIMIT = max(5, int(os.getenv("KB_COLLECTION_FIELD_LIMIT", "40")))
+KB_COLLECTION_SAMPLE_VALUES_LIMIT = max(1, int(os.getenv("KB_COLLECTION_SAMPLE_VALUES_LIMIT", "5")))
+KB_COLLECTION_OVERVIEW_LIMIT = max(1, int(os.getenv("KB_COLLECTION_OVERVIEW_LIMIT", "3")))
+KB_PROFILE_SCAN_DOC_LIMIT = max(0, int(os.getenv("KB_PROFILE_SCAN_DOC_LIMIT", "0")))
+FIRESTORE_TRUNCATE_EVENT_PAYLOAD = os.getenv("FIRESTORE_TRUNCATE_EVENT_PAYLOAD", "0") == "1"
+FIRESTORE_LOG_TEXT_LIMIT = max(256, int(os.getenv("FIRESTORE_LOG_TEXT_LIMIT", "4000")))
+FIRESTORE_LOG_LIST_LIMIT = max(1, int(os.getenv("FIRESTORE_LOG_LIST_LIMIT", "20")))
+
+COLLECTION_CONTEXT_KEYWORDS = {
+    "all",
+    "chart",
+    "charts",
+    "collection",
+    "columns",
+    "compare",
+    "dashboard",
+    "distribution",
+    "field",
+    "fields",
+    "full",
+    "graph",
+    "histogram",
+    "overview",
+    "plot",
+    "schema",
+    "scatter",
+    "stats",
+    "summary",
+    "bieu do",
+    "cot",
+    "thong ke",
+    "tong quan",
+    "truong",
+}
 
 
 def normalize_text_block(text: Any) -> str:
@@ -117,12 +155,41 @@ class FirebaseStore:
         if not self.client:
             return
         try:
-            self.client.collection("events").add(event)
+            payload = self._sanitize_payload(event) if FIRESTORE_TRUNCATE_EVENT_PAYLOAD else event
+            self.client.collection("events").add(payload)
             self.last_error = ""
         except Exception:
             self.last_error = traceback.format_exc()
             if KB_ENABLE_TIMING_LOGS:
                 print(self.last_error)
+
+    def _sanitize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: self._sanitize_value(value)
+            for key, value in payload.items()
+        }
+
+    def _sanitize_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if len(text) <= FIRESTORE_LOG_TEXT_LIMIT:
+                return text
+            hidden = len(text) - FIRESTORE_LOG_TEXT_LIMIT
+            return f"{text[:FIRESTORE_LOG_TEXT_LIMIT]}... [truncated {hidden} chars]"
+
+        if isinstance(value, dict):
+            return {
+                str(key): self._sanitize_value(child)
+                for key, child in list(value.items())[:FIRESTORE_LOG_LIST_LIMIT]
+            }
+
+        if isinstance(value, list):
+            return [
+                self._sanitize_value(item)
+                for item in value[:FIRESTORE_LOG_LIST_LIMIT]
+            ]
+
+        return value
 
     def _threads_collection(self):
         if not self.client:
@@ -178,6 +245,7 @@ class MongoKnowledgeBase:
         self.collections: List[Tuple[str, Any]] = []
         self.signature: Optional[Tuple[str, str, Tuple[str, ...]]] = None
         self.preloaded_docs: Dict[str, List[Dict[str, Any]]] = {}
+        self.collection_profiles: Dict[str, Dict[str, Any]] = {}
         self.last_error = ""
 
     def _close(self) -> None:
@@ -189,6 +257,7 @@ class MongoKnowledgeBase:
         self.client = None
         self.collections = []
         self.signature = None
+        self.collection_profiles = {}
 
     def _parse_collection_names(self, collection_names: str) -> List[str]:
         names = [normalize_text_block(name) for name in collection_names.split(",")]
@@ -304,10 +373,8 @@ class MongoKnowledgeBase:
                 return name, 0
 
         max_workers = min(len(self.collections), int(os.getenv("KB_PRELOAD_WORKERS", "8")))
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         futures = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
             for pair in self.collections:
                 futures.append(executor.submit(_load, pair))
             for fut in as_completed(futures):
@@ -353,19 +420,57 @@ class MongoKnowledgeBase:
         db_name: str,
         collection_names: str,
     ) -> Tuple[List[Dict[str, str]], str]:
-        # Simplified search: return all documents formatted for prompt inclusion.
         start = time.time()
         collections = self._connect(uri_template, password, db_name, collection_names)
         if collections is None:
             return [], self.last_error
 
-        # Normalize query_text for status, but we always return full documents
-        _ = normalize_text_block(query_text)
+        normalized_query = normalize_text_block(query_text)
+        if not normalized_query:
+            return [], "Knowledge Base skipped because the query is empty."
 
-        documents = self.get_all_documents_for_prompt()
+        result_limit = KB_RESULT_LIMIT
+        overview_documents = self.get_collection_overviews(normalized_query)
+        scored_results: List[Tuple[int, Dict[str, str]]] = []
+        max_workers = min(len(collections), int(os.getenv("KB_SEARCH_WORKERS", "8")))
+
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            futures = [
+                executor.submit(
+                    self._search_collection,
+                    collection_name,
+                    collection,
+                    normalized_query,
+                    result_limit,
+                )
+                for collection_name, collection in collections
+            ]
+            for future in as_completed(futures):
+                try:
+                    scored_results.extend(future.result())
+                except Exception as exc:
+                    if KB_ENABLE_TIMING_LOGS:
+                        print(f"[KB SEARCH] worker failed: {exc}")
+
+        scored_results.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].get("title", ""),
+                item[1].get("source", ""),
+            )
+        )
+        documents = overview_documents + [document for _, document in scored_results[:result_limit]]
         elapsed_ms = (time.time() - start) * 1000
-        log_kb_timing("search (full-doc return)", elapsed_ms, f"returned={len(documents)}")
-        return documents, f"Knowledge Base returned {len(documents)} document(s) from {len(collections)} collection(s)."
+        log_kb_timing("search", elapsed_ms, f"returned={len(documents)}")
+        if documents:
+            overview_suffix = f", plus {len(overview_documents)} collection overview(s)" if overview_documents else ""
+            return documents, (
+                f"Knowledge Base returned {len(documents)} relevant document(s) "
+                f"from {len(collections)} collection(s){overview_suffix}."
+            )
+        return [], (
+            f"Knowledge Base found no relevant documents across {len(collections)} collection(s)."
+        )
 
 
 
@@ -396,6 +501,236 @@ class MongoKnowledgeBase:
         fragments: List[str] = []
         self._collect_text_fragments(payload, fragments)
         return normalize_text_block(" ".join(fragments))[:KB_TEXT_LIMIT]
+
+    def _normalize_lookup_name(self, name: str) -> str:
+        return normalize_text_block(name).lower().replace("-", " ").replace("_", " ")
+
+    def _resolve_collection_name(self, collection_name: str) -> str:
+        target = self._normalize_lookup_name(collection_name)
+        for name, _ in self.collections:
+            if self._normalize_lookup_name(name) == target:
+                return name
+        aliases = {
+            "apartement": "Apartment",
+            "advertisement": "Advertisement",
+        }
+        alias_target = aliases.get(target)
+        if alias_target:
+            for name, _ in self.collections:
+                if name == alias_target:
+                    return name
+        return collection_name
+
+    def _matches_collection_name(self, query_text: str, collection_name: str) -> bool:
+        lowered_query = self._normalize_lookup_name(query_text)
+        lowered_name = self._normalize_lookup_name(collection_name)
+        return re.search(rf"(?<!\w){re.escape(lowered_name)}(?!\w)", lowered_query) is not None
+
+    def _requested_collection_names(self, query_text: str) -> List[str]:
+        requested: List[str] = []
+        for name, _ in self.collections:
+            if self._matches_collection_name(query_text, name):
+                requested.append(name)
+        return requested
+
+    def _needs_collection_context(self, query_text: str, requested_collections: List[str]) -> bool:
+        if not requested_collections:
+            return False
+        lowered_query = self._normalize_lookup_name(query_text)
+        if any(keyword in lowered_query for keyword in COLLECTION_CONTEXT_KEYWORDS):
+            return True
+        return len(requested_collections) == 1
+
+    def _flatten_document_fields(
+        self,
+        value: Any,
+        result: Dict[str, Any],
+        prefix: str = "",
+        depth: int = 0,
+    ) -> None:
+        if depth > 2:
+            if prefix:
+                result[prefix] = value
+            return
+
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in KB_IGNORED_KEYS:
+                    continue
+                child_prefix = f"{prefix}.{key}" if prefix else str(key)
+                self._flatten_document_fields(child, result, child_prefix, depth + 1)
+            return
+
+        if isinstance(value, list):
+            if prefix:
+                result[prefix] = value
+            for item in value[:KB_LIST_ITEMS_LIMIT]:
+                if isinstance(item, dict):
+                    self._flatten_document_fields(item, result, prefix, depth + 1)
+            return
+
+        if prefix:
+            result[prefix] = value
+
+    def _sample_display_value(self, value: Any) -> str:
+        if isinstance(value, list):
+            fragments: List[str] = []
+            for item in value[:3]:
+                text = normalize_text_block(item)
+                if text:
+                    fragments.append(text)
+            return ", ".join(fragments)
+        return normalize_text_block(value)
+
+    def _coerce_number(self, value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if not isinstance(value, str):
+            return None
+
+        text = value.strip().lower()
+        if not text:
+            return None
+        if re.search(r"[a-df-z]", text):
+            return None
+        text = text.replace(",", "")
+        text = text.replace("_", "")
+        text = text.replace("%", "")
+        if not re.fullmatch(r"[+\-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+\-]?\d+)?", text):
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _build_collection_profile(self, collection_name: str, collection: Any) -> Dict[str, Any]:
+        total_docs = 0
+        field_stats: Dict[str, Dict[str, Any]] = {}
+
+        for doc in self._iter_collection_documents(collection_name, collection):
+            total_docs += 1
+            flattened: Dict[str, Any] = {}
+            self._flatten_document_fields(doc, flattened)
+
+            for field_name, value in flattened.items():
+                if not field_name:
+                    continue
+                stats = field_stats.setdefault(
+                    field_name,
+                    {
+                        "count": 0,
+                        "numeric_count": 0,
+                        "sample_counter": Counter(),
+                        "min": None,
+                        "max": None,
+                    },
+                )
+                stats["count"] += 1
+
+                sample = self._sample_display_value(value)
+                if sample:
+                    stats["sample_counter"][sample] += 1
+
+                numeric_value = self._coerce_number(value)
+                if numeric_value is not None:
+                    stats["numeric_count"] += 1
+                    stats["min"] = numeric_value if stats["min"] is None else min(stats["min"], numeric_value)
+                    stats["max"] = numeric_value if stats["max"] is None else max(stats["max"], numeric_value)
+
+            if KB_PROFILE_SCAN_DOC_LIMIT and total_docs >= KB_PROFILE_SCAN_DOC_LIMIT:
+                break
+
+        ordered_fields: List[Tuple[str, Dict[str, Any]]] = []
+        for field_name, stats in field_stats.items():
+            ordered_fields.append(
+                (
+                    field_name,
+                    {
+                        "count": stats["count"],
+                        "numeric_count": stats["numeric_count"],
+                        "samples": [
+                            sample
+                            for sample, _ in stats["sample_counter"].most_common(KB_COLLECTION_SAMPLE_VALUES_LIMIT)
+                        ],
+                        "min": stats["min"],
+                        "max": stats["max"],
+                    },
+                )
+            )
+
+        ordered_fields.sort(key=lambda item: (-item[1]["count"], item[0]))
+        return {
+            "collection": collection_name,
+            "total_docs": total_docs,
+            "fields": ordered_fields,
+        }
+
+    def _get_collection_profile(self, collection_name: str) -> Optional[Dict[str, Any]]:
+        resolved_name = self._resolve_collection_name(collection_name)
+        if resolved_name in self.collection_profiles:
+            return self.collection_profiles[resolved_name]
+
+        for name, collection in self.collections:
+            if name != resolved_name:
+                continue
+            profile = self._build_collection_profile(name, collection)
+            self.collection_profiles[name] = profile
+            return profile
+        return None
+
+    def _format_collection_overview(self, profile: Dict[str, Any]) -> Dict[str, str]:
+        total_docs = profile.get("total_docs", 0)
+        fields: List[Tuple[str, Dict[str, Any]]] = profile.get("fields", [])
+        available_fields = [
+            f"{field_name} ({stats['count']}/{total_docs})"
+            for field_name, stats in fields[:KB_COLLECTION_FIELD_LIMIT]
+        ]
+        numeric_lines = [
+            f"{field_name}: count={stats['numeric_count']}, min={stats['min']}, max={stats['max']}"
+            for field_name, stats in fields
+            if stats["numeric_count"] > 0 and stats["numeric_count"] >= max(1, stats["count"] // 2)
+        ][: min(10, KB_COLLECTION_FIELD_LIMIT)]
+        categorical_lines = [
+            f"{field_name}: sample={', '.join(stats['samples'])}"
+            for field_name, stats in fields
+            if stats["samples"] and stats["numeric_count"] == 0
+        ][: min(10, KB_COLLECTION_FIELD_LIMIT)]
+
+        lines = [
+            f"Collection: {profile['collection']}",
+            f"Rows available: {total_docs}",
+            "Available fields: " + (", ".join(available_fields) if available_fields else "(none)"),
+        ]
+        if numeric_lines:
+            lines.append("Numeric-like fields: " + " | ".join(numeric_lines))
+        if categorical_lines:
+            lines.append("Categorical-like fields: " + " | ".join(categorical_lines))
+        lines.append(
+            f"For generated Python code, use load_kb_collection('{profile['collection']}') to access the full collection as a pandas DataFrame."
+        )
+        lines.append(
+            f"You can inspect schema details in code with get_kb_collection_schema('{profile['collection']}')."
+        )
+        return {
+            "title": f"{profile['collection']} collection overview",
+            "source": f"{profile['collection']} | collection_overview",
+            "snippet": "\n".join(lines),
+        }
+
+    def get_collection_overviews(self, query_text: str) -> List[Dict[str, str]]:
+        requested_collections = self._requested_collection_names(query_text)
+        if not self._needs_collection_context(query_text, requested_collections):
+            return []
+
+        overviews: List[Dict[str, str]] = []
+        for collection_name in requested_collections[:KB_COLLECTION_OVERVIEW_LIMIT]:
+            profile = self._get_collection_profile(collection_name)
+            if profile is None:
+                continue
+            overviews.append(self._format_collection_overview(profile))
+        return overviews
 
     def _collect_text_fragments(self, value: Any, fragments: List[str]) -> None:
         if isinstance(value, str):
@@ -428,12 +763,86 @@ class MongoKnowledgeBase:
                 score += 2 if len(token) > 4 else 1
         return score
 
+    def _score_document(self, doc: Dict[str, Any], text: str, query_text: str) -> int:
+        title = self._pick_first_value(doc, KB_TITLE_KEYS)
+        source = self._pick_first_value(doc, KB_SOURCE_KEYS)
+        score = self._score_text(text, query_text)
+        score += self._score_text(title, query_text) * 3
+        score += self._score_text(source, query_text) * 2
+        return score
+
     def _snippet_for_query(self, text: str, query_text: str, radius: int = None) -> str:
         if radius is None:
-            radius = int(os.getenv("KB_SNIPPET_LIMIT", "150")) // 2  # Default radius based on snippet limit
+            radius = KB_SNIPPET_LIMIT // 2
         if not text:
             return ""
-        
+
+        text = normalize_text_block(text)
+        lowered_text = text.lower()
+        lowered_query = query_text.lower()
+
+        match_start = lowered_text.find(lowered_query) if lowered_query else -1
+        match_length = len(lowered_query)
+
+        if match_start < 0:
+            for token in sorted(tokenize_search_text(query_text), key=len, reverse=True):
+                match_start = lowered_text.find(token)
+                if match_start >= 0:
+                    match_length = len(token)
+                    break
+
+        if match_start < 0:
+            return text[:KB_SNIPPET_LIMIT]
+
+        start = max(0, match_start - radius)
+        end = min(len(text), match_start + match_length + radius)
+        snippet = text[start:end].strip()
+        if start > 0:
+            snippet = f"...{snippet}"
+        if end < len(text):
+            snippet = f"{snippet}..."
+        return snippet[:KB_SNIPPET_LIMIT + 6]
+
+    def _iter_collection_documents(self, collection_name: str, collection: Any):
+        preloaded = self.preloaded_docs.get(collection_name)
+        if preloaded is not None:
+            return preloaded
+        try:
+            return collection.find({})
+        except Exception:
+            return []
+
+    def _search_collection(
+        self,
+        collection_name: str,
+        collection: Any,
+        query_text: str,
+        result_limit: int,
+    ) -> List[Tuple[int, Dict[str, str]]]:
+        matches: List[Tuple[int, Dict[str, str]]] = []
+        for doc in self._iter_collection_documents(collection_name, collection):
+            try:
+                text = self._document_text(doc)
+                if not text:
+                    continue
+                score = self._score_document(doc, text, query_text)
+                if score <= 0:
+                    continue
+                snippet = self._snippet_for_query(text, query_text)
+                result = self._label_result(self._format_result(doc, snippet), collection_name)
+                matches.append((score, result))
+            except Exception:
+                continue
+
+        matches.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].get("title", ""),
+                item[1].get("source", ""),
+            )
+        )
+        return matches[:result_limit]
+
     def get_preload_summary(self) -> Dict[str, Any]:
         """Return a diagnostic summary about preloaded documents and text-index presence.
 
@@ -474,6 +883,90 @@ class MongoKnowledgeBase:
             pass
         return summary
 
+    def get_collection_records(
+        self,
+        uri_template: str,
+        password: str,
+        db_name: str,
+        collection_names: str,
+        collection_name: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        collections = self._connect(uri_template, password, db_name, collection_names)
+        if collections is None:
+            return []
+
+        resolved_name = self._resolve_collection_name(collection_name)
+        for name, collection in collections:
+            if name != resolved_name:
+                continue
+            docs = list(self._iter_collection_documents(name, collection))
+            if limit is not None:
+                return docs[: max(0, limit)]
+            return docs
+        return []
+
+    def get_collection_dataframe_records(
+        self,
+        uri_template: str,
+        password: str,
+        db_name: str,
+        collection_names: str,
+        collection_name: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        docs = self.get_collection_records(
+            uri_template=uri_template,
+            password=password,
+            db_name=db_name,
+            collection_names=collection_names,
+            collection_name=collection_name,
+            limit=limit,
+        )
+        rows: List[Dict[str, Any]] = []
+        for doc in docs:
+            row = dict(doc)
+            if "_id" in row:
+                row["_id"] = str(row["_id"])
+            rows.append(row)
+        return rows
+
+    def describe_collection(
+        self,
+        uri_template: str,
+        password: str,
+        db_name: str,
+        collection_names: str,
+        collection_name: str,
+    ) -> Dict[str, Any]:
+        collections = self._connect(uri_template, password, db_name, collection_names)
+        if collections is None:
+            return {}
+
+        resolved_name = self._resolve_collection_name(collection_name)
+        profile = self._get_collection_profile(resolved_name)
+        if profile is None:
+            return {}
+
+        fields_payload: List[Dict[str, Any]] = []
+        for field_name, stats in profile.get("fields", [])[:KB_COLLECTION_FIELD_LIMIT]:
+            fields_payload.append(
+                {
+                    "name": field_name,
+                    "count": stats["count"],
+                    "numeric_count": stats["numeric_count"],
+                    "samples": list(stats["samples"]),
+                    "min": stats["min"],
+                    "max": stats["max"],
+                }
+            )
+
+        return {
+            "collection": profile.get("collection", resolved_name),
+            "total_docs": profile.get("total_docs", 0),
+            "fields": fields_payload,
+        }
+
     def get_all_documents_for_prompt(self) -> List[Dict[str, str]]:
         """Return all documents (across collections) formatted for prompt inclusion.
 
@@ -483,17 +976,7 @@ class MongoKnowledgeBase:
         results: List[Dict[str, str]] = []
         try:
             for name, collection in self.collections:
-                docs_iter = None
-                preloaded = self.preloaded_docs.get(name)
-                if preloaded is not None:
-                    docs_iter = preloaded
-                else:
-                    try:
-                        docs_iter = collection.find({})
-                    except Exception:
-                        docs_iter = []
-
-                for doc in docs_iter:
+                for doc in self._iter_collection_documents(name, collection):
                     try:
                         text = self._document_text(doc)
                         snippet = text

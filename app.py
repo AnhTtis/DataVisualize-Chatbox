@@ -159,7 +159,7 @@ def lookup_knowledge_base(
     password: str,
     db_name: str,
     collection_name: str,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, List[Dict[str, str]]]:
     # If configured to include all documents, return full preloaded/scanned docs.
     if KB_INCLUDE_ALL_DOCS_IN_PROMPT:
         # Ensure connection and preload have run
@@ -167,10 +167,12 @@ def lookup_knowledge_base(
             uri_template, password, db_name, collection_name
         )
         if collections is None:
-            return "", knowledge_base.last_error
+            return "", knowledge_base.last_error, []
         documents = knowledge_base.get_all_documents_for_prompt()
-        return format_knowledge_base_context(documents), (
-            f"Knowledge Base included all documents from {len(collections)} collection(s)."
+        return (
+            format_knowledge_base_context(documents),
+            f"Knowledge Base included all documents from {len(collections)} collection(s).",
+            documents,
         )
 
     documents, status = knowledge_base.search(
@@ -180,7 +182,7 @@ def lookup_knowledge_base(
         db_name=db_name,
         collection_names=collection_name,
     )
-    return format_knowledge_base_context(documents), status
+    return format_knowledge_base_context(documents), status, documents
 
 
 def build_client() -> Optional[genai.Client]:
@@ -213,6 +215,16 @@ def render_prompt(config: Dict[str, Any], knowledge_base_context: str = "") -> s
     parts.append("Do not refuse general questions just because they are outside the Knowledge Base.")
     parts.append(
         "If you generate code, wrap it in a fenced block using triple backticks."
+    )
+    parts.append(
+        "For collection-wide analysis or charts, generated Python code can call "
+        "`load_kb_collection(collection_name)` to load the full MongoDB collection into a pandas DataFrame."
+    )
+    parts.append(
+        "Generated Python code can call `get_kb_collection_schema(collection_name)` to inspect available columns and field coverage."
+    )
+    parts.append(
+        "Generated Python code can call `list_kb_collections()` to see configured MongoDB collection names."
     )
     if knowledge_base_context:
         parts.append("Knowledge Base Context:")
@@ -247,6 +259,34 @@ def get_text_from_upload(path: str) -> str:
     return ""
 
 
+def load_kb_collection(collection_name: str, limit: Optional[int] = None):
+    import pandas as pd
+
+    rows = knowledge_base.get_collection_dataframe_records(
+        uri_template=DEFAULT_MONGODB_URI_TEMPLATE,
+        password=DEFAULT_MONGODB_PASSWORD,
+        db_name=DEFAULT_MONGODB_DB_NAME,
+        collection_names=DEFAULT_MONGODB_COLLECTION_NAME,
+        collection_name=collection_name,
+        limit=limit,
+    )
+    return pd.DataFrame(rows)
+
+
+def get_kb_collection_schema(collection_name: str) -> Dict[str, Any]:
+    return knowledge_base.describe_collection(
+        uri_template=DEFAULT_MONGODB_URI_TEMPLATE,
+        password=DEFAULT_MONGODB_PASSWORD,
+        db_name=DEFAULT_MONGODB_DB_NAME,
+        collection_names=DEFAULT_MONGODB_COLLECTION_NAME,
+        collection_name=collection_name,
+    )
+
+
+def list_kb_collections() -> List[str]:
+    return knowledge_base._parse_collection_names(DEFAULT_MONGODB_COLLECTION_NAME)
+
+
 def run_code(code: str) -> Tuple[str, Optional[str]]:
     stdout_buffer = io.StringIO()
     image_path = None
@@ -258,8 +298,15 @@ def run_code(code: str) -> Tuple[str, Optional[str]]:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
+        exec_globals = {
+            "plt": plt,
+            "load_kb_collection": load_kb_collection,
+            "get_kb_collection_schema": get_kb_collection_schema,
+            "list_kb_collections": list_kb_collections,
+        }
+
         def try_exec() -> None:
-            exec(code, {"plt": plt}, local_env)
+            exec(code, exec_globals, local_env)
 
         def install_module(module_name: str) -> None:
             # Best-effort install for missing modules in generated code.
@@ -563,7 +610,7 @@ def handle_chat(
     if extra_text:
         user_text += "\n\nAttached content:\n" + extra_text
 
-    knowledge_base_context, knowledge_base_status = lookup_knowledge_base(
+    knowledge_base_context, knowledge_base_status, knowledge_base_documents = lookup_knowledge_base(
         query_text=user_text,
         uri_template=mongo_uri_template,
         password=mongo_password,
@@ -572,8 +619,6 @@ def handle_chat(
     )
     system_prompt = render_prompt(config, knowledge_base_context)
     current_turn_text = user_text
-    if knowledge_base_context:
-        current_turn_text += "\n\nRelevant Knowledge Base Context:\n" + knowledge_base_context
 
     thread = state["threads"][state["active_id"]]
     history = thread["messages"]
@@ -608,18 +653,31 @@ def handle_chat(
     history.append({"role": "user", "content": message, "model_content": user_text})
     history.append({"role": "assistant", "content": bot_text})
 
+    code = extract_code(bot_text) or ""
+
     store.log_event({
         "type": "chat",
         "ts": now_ts(),
         "thread_id": state["active_id"],
+        "model": config.get("model", DEFAULT_MODEL),
+        "thread_title": thread.get("title", ""),
         "user": message,
+        "user_full_text": user_text,
         "bot": bot_text,
-        "prompt": system_prompt,
+        "behavior": config.get("behavior", ""),
+        "assistant_code": code,
+        "assistant_error": error_message,
         "knowledge_base_status": knowledge_base_status,
-        "knowledge_base_context": knowledge_base_context,
+        "knowledge_base_result_count": len(knowledge_base_documents),
+        "knowledge_base_documents": knowledge_base_documents,
+        "knowledge_base_sources": [
+            doc.get("source", "")
+            for doc in knowledge_base_documents
+            if doc.get("source")
+        ],
+        "message_count_after_turn": len(history),
     })
 
-    code = extract_code(bot_text) or ""
     status = "Pending approval" if code else ""
     thread["code"] = code
     thread["code_status"] = status
@@ -651,9 +709,12 @@ def approve_code(state: Dict[str, Any], code: str) -> Tuple[Dict[str, Any], str,
     store.log_event({
         "type": "code_execution",
         "ts": now_ts(),
+        "thread_id": state["active_id"],
+        "thread_title": thread.get("title", ""),
         "code": code,
         "output": output,
         "image": image_path,
+        "code_status": thread["code_status"],
     })
     return state, output, image_path, "Approved and executed"
 
