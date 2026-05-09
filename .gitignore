@@ -1,4 +1,9 @@
 .env
-secrets/
+secrets/*
+!secrets/CHATBOX_OPERATIONS.md
+!secrets/skills/
+!secrets/skills/*.md
+!secrets/tools/
+!secrets/tools/*.md
 __pycache__/
 *.pyc

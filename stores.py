@@ -1,12 +1,15 @@
+import io
 import os
 import re
 import time
 import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
@@ -118,14 +121,21 @@ def log_kb_timing(operation: str, duration_ms: float, details: str = "") -> None
         print(f"[KB TIMING] {operation}: {duration_ms:.1f}ms{suffix}")
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class FirebaseStore:
     def __init__(self) -> None:
         self.project_id = os.getenv("FIREBASE_PROJECT_ID")
         self.credentials_path = resolve_local_path(os.getenv("FIREBASE_CREDENTIALS_JSON"))
         self.database_id = os.getenv("FIREBASE_DATABASE_ID", "(default)")
         self.chat_namespace = os.getenv("FIREBASE_CHAT_NAMESPACE", "default")
+        self.media_fallback_dir = (Path(__file__).resolve().parent / "artifacts" / "chatbox_cache" / "media_fallback")
         self.enabled = bool(self.project_id and self.credentials_path)
         self.last_error = ""
+        self._mongo_media_client = None
+        self._mongo_media_signature: Optional[Tuple[str, str]] = None
         self._init_client()
 
     def _init_client(self) -> None:
@@ -215,6 +225,9 @@ class FirebaseStore:
             "created_at": thread.get("created_at", ""),
             "updated_at": thread.get("updated_at", ""),
             "order_index": int(thread.get("order_index", 0)),
+            "uploaded_files": thread.get("uploaded_files", []),
+            "image_history": thread.get("image_history", []),
+            "last_exec_image_asset_id": thread.get("last_exec_image_asset_id", ""),
         }
         try:
             collection.document(thread_id).set(payload)
@@ -237,6 +250,215 @@ class FirebaseStore:
             if KB_ENABLE_TIMING_LOGS:
                 print(self.last_error)
             return []
+
+    def _connect_mongo_media(self, uri_template: str, password: str, db_name: str):
+        db_name = normalize_text_block(db_name)
+        if not db_name:
+            raise RuntimeError("MongoDB media fallback needs MONGODB_DB_NAME.")
+
+        uri, error = build_mongodb_uri(uri_template, password)
+        if error:
+            raise RuntimeError(error)
+
+        signature = (uri or "", db_name)
+        if self._mongo_media_client is not None and self._mongo_media_signature == signature:
+            return self._mongo_media_client, self._mongo_media_client[db_name]
+
+        if self._mongo_media_client is not None:
+            try:
+                self._mongo_media_client.close()
+            except Exception:
+                pass
+
+        from pymongo import MongoClient
+
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        self._mongo_media_client = client
+        self._mongo_media_signature = signature
+        return client, client[db_name]
+
+    def _save_media_to_mongo(
+        self,
+        thread_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str,
+        kind: str,
+        source: str,
+        uri_template: str,
+        password: str,
+        db_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _, db = self._connect_mongo_media(uri_template, password, db_name)
+
+        from gridfs import GridFSBucket
+
+        safe_name = Path(filename or "").name or f"{kind}-{uuid4().hex}"
+        asset_id = uuid4().hex
+        bucket = GridFSBucket(db, bucket_name="chat_media")
+        gridfs_metadata = {
+            "thread_id": thread_id,
+            "chat_namespace": self.chat_namespace,
+            "kind": kind,
+            "source": source,
+            "content_type": content_type,
+            "asset_id": asset_id,
+            "created_at": utc_now_iso(),
+        }
+        if metadata:
+            gridfs_metadata.update(metadata)
+
+        file_id = bucket.upload_from_stream(
+            safe_name,
+            io.BytesIO(data),
+            metadata=gridfs_metadata,
+        )
+        asset = {
+            "asset_id": asset_id,
+            "name": safe_name,
+            "kind": kind,
+            "source": source,
+            "content_type": content_type,
+            "size_bytes": len(data),
+            "storage_backend": "mongodb",
+            "gridfs_file_id": str(file_id),
+            "created_at": gridfs_metadata["created_at"],
+        }
+        if metadata:
+            asset.update(metadata)
+        return asset
+
+    def _save_media_to_local_cache(
+        self,
+        thread_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str,
+        kind: str,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        safe_name = Path(filename or "").name or f"{kind}-{uuid4().hex}"
+        asset_id = uuid4().hex
+        target_dir = self.media_fallback_dir / self.chat_namespace / (thread_id or "thread") / source
+        target_dir.mkdir(parents=True, exist_ok=True)
+        local_name = f"{asset_id}_{safe_name}"
+        local_path = target_dir / local_name
+        local_path.write_bytes(data)
+
+        asset = {
+            "asset_id": asset_id,
+            "name": safe_name,
+            "kind": kind,
+            "source": source,
+            "content_type": content_type,
+            "size_bytes": len(data),
+            "storage_backend": "local_cache",
+            "local_path": str(local_path),
+            "created_at": utc_now_iso(),
+        }
+        if metadata:
+            asset.update(metadata)
+        return asset
+
+    def save_media(
+        self,
+        thread_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str,
+        kind: str,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        mongo_uri_template: str = "",
+        mongo_password: str = "",
+        mongo_db_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            asset = self._save_media_to_mongo(
+                thread_id=thread_id,
+                filename=filename,
+                data=data,
+                content_type=content_type,
+                kind=kind,
+                source=source,
+                uri_template=mongo_uri_template,
+                password=mongo_password,
+                db_name=mongo_db_name,
+                metadata=metadata,
+            )
+            self.last_error = ""
+            return asset
+        except Exception as exc:
+            mongo_error = str(exc).strip() or "MongoDB GridFS unavailable."
+            if KB_ENABLE_TIMING_LOGS:
+                print(mongo_error)
+
+        try:
+            asset = self._save_media_to_local_cache(
+                thread_id=thread_id,
+                filename=filename,
+                data=data,
+                content_type=content_type,
+                kind=kind,
+                source=source,
+                metadata=metadata,
+            )
+            self.last_error = (
+                "MongoDB GridFS unavailable. Media was cached locally for UI continuity."
+            )
+            return asset
+        except Exception:
+            local_error = traceback.format_exc().strip()
+            combined = "\n\n".join(part for part in [mongo_error, local_error] if part)
+            self.last_error = combined
+            if KB_ENABLE_TIMING_LOGS:
+                print(combined)
+            return None
+
+    def load_media_bytes(
+        self,
+        asset: Dict[str, Any],
+        mongo_uri_template: str = "",
+        mongo_password: str = "",
+        mongo_db_name: str = "",
+    ) -> Optional[bytes]:
+        backend = normalize_text_block(asset.get("storage_backend", "")).lower()
+        try:
+            if backend == "mongodb":
+                gridfs_file_id = normalize_text_block(asset.get("gridfs_file_id", ""))
+                if not gridfs_file_id:
+                    raise RuntimeError("Missing GridFS file id.")
+
+                _, db = self._connect_mongo_media(mongo_uri_template, mongo_password, mongo_db_name)
+                from bson import ObjectId
+                from gridfs import GridFSBucket
+
+                bucket = GridFSBucket(db, bucket_name="chat_media")
+                stream = bucket.open_download_stream(ObjectId(gridfs_file_id))
+                data = stream.read()
+                self.last_error = ""
+                return data
+
+            if backend == "local_cache":
+                local_path = normalize_text_block(asset.get("local_path", ""))
+                if not local_path:
+                    raise RuntimeError("Missing local cache path.")
+                path = Path(local_path)
+                if not path.exists():
+                    raise RuntimeError(f"Local cache file does not exist: {local_path}")
+                data = path.read_bytes()
+                self.last_error = ""
+                return data
+
+            raise RuntimeError("Unsupported media backend.")
+        except Exception:
+            self.last_error = traceback.format_exc()
+            if KB_ENABLE_TIMING_LOGS:
+                print(self.last_error)
+            return None
 
 
 class MongoKnowledgeBase:

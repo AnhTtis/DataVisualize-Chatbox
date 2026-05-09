@@ -3,9 +3,12 @@
 This is a Gradio demo with:
 - Chat UI with Gemini and conversation list
 - MongoDB-backed Knowledge Base for optional retrieval context
-- Model page (placeholder)
+- Property-price model page (implemented in `app_mode.py`, mounted into `app.py`)
 - Human approval before executing AI-generated code
-- Firestore storage for chat history, code, and outputs
+- Firestore storage for chat metadata
+- MongoDB GridFS for uploaded files and generated chart images
+- Local cache fallback to keep image/file history visible in the UI when MongoDB media storage is unavailable
+- Per-thread file history and chart image gallery in the sidebar
 
 ## Setup
 
@@ -69,14 +72,15 @@ Performance metrics are printed to console when `KB_ENABLE_TIMING_LOGS=1`:
 
 ### Notes
 
-- Firebase storage uses a service account JSON in `FIREBASE_CREDENTIALS_JSON`.
+- Firestore metadata uses a service account JSON in `FIREBASE_CREDENTIALS_JSON`.
+- Set `AUTO_INSTALL_WHITELIST=1` only if you want the app to auto-install missing Python libs; default is off to avoid noisy pip output.
 - Knowledge Base can preload documents across all specified collections, but only top-ranked results are added to the prompt by default.
 - Generated Python code can use `load_kb_collection("House")`, `get_kb_collection_schema("House")`, and `list_kb_collections()` for collection-wide analysis and charts.
+- Generated Python code can also use `list_thread_files()`, `get_thread_file_path(...)`, and `load_thread_file(...)` for files uploaded in the current chat thread.
 - Set `MONGODB_DB_NAME` and `MONGODB_COLLECTION_NAME` in `.env` before using the Knowledge Base.
-
- - Firebase storage uses a service account JSON in `FIREBASE_CREDENTIALS_JSON`.
- - Set `MONGODB_DB_NAME` and `MONGODB_COLLECTION_NAME` in `.env` before using the Knowledge Base.
 - Chat threads are persisted in Firestore under `chat_namespaces/{FIREBASE_CHAT_NAMESPACE}/threads`. If `FIREBASE_CHAT_NAMESPACE` is omitted, the app uses `default`.
 - The app resolves service-account JSON paths from the configured path or from the local `secrets/` folder by filename.
 - Firestore must exist in the configured Firebase project. If your project uses a non-default database, set `FIREBASE_DATABASE_ID`; otherwise create the default Firestore database first.
+- If MongoDB GridFS is unavailable, media assets are cached locally so image/file history remains usable in the UI session. Configuration notes are documented in `docs/tools/storage_backends.md`.
+- Operational guidance that the app can load into prompts lives under `docs/CHATBOX_OPERATIONS.md`, `docs/skills/`, and `docs/tools/`.
 - Code execution is a demo and should be sandboxed for production.
