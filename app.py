@@ -950,22 +950,22 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
     return f"<div class='sidebar-card'><div class='file-history'>{''.join(cards)}</div></div>"
 
 
-def build_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]:
-    choices: List[Tuple[str, str]] = []
-    files = thread.get("uploaded_files", [])
-    for item in reversed(files):
-        name = item.get("name", "unnamed")
-        size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
-        asset_id = item.get("asset_id", "")
-        value = asset_id or name
-        label = f"{name} ({size_text})"
-        choices.append((label, value))
-    return choices
+# def build_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]:
+#     choices: List[Tuple[str, str]] = []
+#     files = thread.get("uploaded_files", [])
+#     for item in reversed(files):
+#         name = item.get("name", "unnamed")
+#         size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
+#         asset_id = item.get("asset_id", "")
+#         value = asset_id or name
+#         label = f"{name} ({size_text})"
+#         choices.append((label, value))
+#     return choices
 
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str]:
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -975,7 +975,7 @@ def get_thread_payload(
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        gr.update(choices=build_download_choices(thread), value=None),
+        # gr.update(choices=build_download_choices(thread), value=None),
     )
 
 
@@ -993,7 +993,7 @@ def select_thread(
     List[Tuple[Any, str]],
     str,
     str,
-    gr.Dropdown,
+    # gr.Dropdown,
     str,
     Any,
 ]:
@@ -1001,9 +1001,13 @@ def select_thread(
         thread_id = state["active_id"]
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
-        get_thread_payload(thread)
+    
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
+         get_thread_payload(thread)
     )
+    # messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
+    #     get_thread_payload(thread)
+    # )
     return (
         state,
         refresh_thread_list(state),
@@ -1015,7 +1019,7 @@ def select_thread(
         image_gallery,
         file_html,
         error,
-        download_choices,
+        # download_choices,
         "",
         gr.update(value=None),
     )
@@ -1034,7 +1038,7 @@ def new_thread(
     List[Tuple[Any, str]],
     str,
     str,
-    gr.Dropdown,
+    # gr.Dropdown,
     str,
     Any,
 ]:
@@ -1056,7 +1060,7 @@ def new_thread(
         [],
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        gr.update(choices=build_download_choices(thread), value=None),
+        # gr.update(choices=build_download_choices(thread), value=None),
         "",
         gr.update(value=None),
     )
@@ -1111,7 +1115,7 @@ def handle_chat(
     List[Tuple[Any, str]],
     str,
     str,
-    gr.Dropdown,
+    # gr.Dropdown,
     str,
     Any,
 ]:
@@ -1120,7 +1124,7 @@ def handle_chat(
 
     uploaded_paths = [str(path) for path in (upload_paths or []) if str(path).strip()]
     if not normalize_text_block(message) and not uploaded_paths:
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
             get_thread_payload(thread)
         )
         return (
@@ -1134,7 +1138,7 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            download_choices,
+            # download_choices,
             "",
             gr.update(value=None),
         )
@@ -1170,7 +1174,7 @@ def handle_chat(
     if not client:
         thread["error"] = merge_errors("Missing GEMINI_API_KEY", upload_error)
         persist_thread(state, state["active_id"], touch=True)
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
             get_thread_payload(thread)
         )
         return (
@@ -1184,7 +1188,7 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            download_choices,
+            # download_choices,
             "",
             gr.update(value=None),
         )
@@ -1235,7 +1239,7 @@ def handle_chat(
 
     persist_thread(state, state["active_id"], touch=True)
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
         get_thread_payload(thread)
     )
     return (
@@ -1249,7 +1253,7 @@ def handle_chat(
         image_gallery,
         file_html,
         error,
-        download_choices,
+        #  download_choices,
         "",
         gr.update(value=None),
     )
