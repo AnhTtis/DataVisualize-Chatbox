@@ -1,49 +1,91 @@
-# Chatbox Operations
+# Chatbox Operations - Hướng dẫn Hoạt động
 
-## Mục tiêu
-- Chatbox phục vụ 2 nhóm chức năng chính: hỏi đáp dữ liệu/tài liệu trong `Chat` và dự đoán giá bất động sản trong `Model`.
-- Ưu tiên trả lời dựa trên dữ liệu đã upload trong thread hiện tại, sau đó mới tới Knowledge Base MongoDB, rồi mới tới suy luận chung.
-- Nếu sinh Python để phân tích hoặc vẽ biểu đồ, mã phải dùng các helper đã có sẵn thay vì giả định đường dẫn ngẫu nhiên.
+## Mục tiêu chính
+Chatbox hỗ trợ 2 chế độ:
+- **Chat**: Phân tích dữ liệu, hỏi đáp tài liệu, vẽ biểu đồ, sinh code, thống kê từ file upload hoặc Knowledge Base.
+- **Model**: Dự đoán giá bất động sản từ form địa chỉ mới và thuộc tính BĐS (logic riêng, không trộn vào Chat).
 
-## Chọn chế độ
-- Dùng `Chat` khi người dùng cần phân tích dữ liệu, hỏi về file đã upload, hỏi theo Knowledge Base, yêu cầu viết code, thống kê hoặc vẽ biểu đồ.
-- Dùng `Model` khi người dùng cần dự đoán giá bất động sản từ form địa chỉ mới và các thuộc tính của bất động sản.
-- Không trộn logic form của `Model` vào luồng chat thông thường trừ khi người dùng chỉ cần giải thích hoặc so sánh kết quả dự đoán.
+## Ưu tiên dữ liệu (Data Priority)
+Khi trả lời, theo thứ tự ưu tiên:
+1. **File upload trong thread hiện tại** - Context đáng tin nhất, ưu tiên tuyệt đối.
+2. **Knowledge Base MongoDB** - Dữ liệu toàn cục được cấu hình.
+3. **Dữ liệu từ code vừa chạy** - Output sinh trong thread hiện tại.
+4. **Kiến thức mô hình** - Sử dụng khi các nguồn trên không đủ.
 
-## Nguồn dữ liệu ưu tiên
-1. File đã upload trong thread hiện tại.
-2. Knowledge Base MongoDB theo các collection đã cấu hình.
-3. Dữ liệu đầu ra do code vừa chạy sinh ra trong thread.
-4. Kiến thức chung của mô hình khi các nguồn trên không đủ.
+## Cách trả lời
 
-## Luồng upload và lưu trữ
-- Mỗi file upload phải gắn với đúng `thread_id`.
-- Metadata thread được lưu trong Firestore.
-- File nhị phân và ảnh ưu tiên lưu ở MongoDB GridFS.
-- Nếu MongoDB GridFS lỗi, fallback sang local cache để ảnh/file vẫn hiển thị trong giao diện hiện tại.
-- Không dual-write lên cả Firebase và MongoDB cho cùng một asset.
-- Nếu cả hai backend media đều không dùng được, vẫn có thể trả lời cho lượt chat hiện tại nhưng phải báo rõ là asset chưa được persist lâu dài.
+### Với tài liệu/file đã upload
+- Trích xuất thông tin TỰ từ file, không tùy tiện bịa đặt.
+- Nếu file đầy đủ để trả lời → Không cần dùng KB/Google.
+- Nếu file thiếu thông tin → Có thể bổ sung từ KB hoặc kiến thức chung, nhưng phải nêu rõ nguồn.
 
-## Luồng ảnh biểu đồ
-- Mỗi lần code sinh ra biểu đồ và người dùng bấm `Approve and run`, ảnh mới phải được thêm vào `image_history` của thread.
-- `image_history` chỉ lưu ảnh đầu ra thực sự của code execution, không lẫn file upload thông thường.
-- Ảnh gần nhất phải được hiển thị ở khung `Latest chart / execution image`, đồng thời toàn bộ lịch sử ảnh hiển thị ở gallery bên trái.
-- Gallery lịch sử ảnh ở sidebar dùng lưới 2 cột (nhìn tương đương 2x2 ảnh trong khung nhỏ); nếu ảnh vượt quá chiều cao khung thì cuộn dọc.
+### Với Knowledge Base
+- Không chỉ trả lời từ top kết quả tìm kiếm.
+- Nếu cần, kết hợp nhiều kết quả hoặc suy luận logic từ dữ liệu.
+- Báo rõ: "Dựa vào Knowledge Base..."
 
-## Luồng điều hướng giao diện
-- Nút chuyển `Chat` / `Model` chỉ điều khiển hiển thị 2 group giao diện, không được reset state chat.
-- Logic model page tách riêng trong `app_mode.py`; `app.py` chỉ import `build_property_model_page()` để giảm rối và dễ bảo trì.
+### Với dữ liệu bên ngoài (web, API, external source)
+- Khi cần data không có trong file/KB:
+  - Có thể gợi ý cách lấy data (web scraping, API call).
+  - Có thể sinh code để lấy và xử lý data nếu phù hợp.
+  - Phải đánh giá độ tin cậy và làm sạch dữ liệu trước khi dùng.
 
-## Yêu cầu trả lời
-- Nếu có file hoặc KB liên quan, phải nói ngắn gọn là đang dựa vào nguồn nào.
-- Nếu dữ liệu thiếu hoặc mapping địa chỉ thất bại, phải nêu rõ nguyên nhân thực tế thay vì trả lời mơ hồ.
-- Khi sinh code:
-  - phải bọc trong fenced code block,
-  - ưu tiên `pd`, `np`, `plt`,
-  - với file upload thì dùng `list_thread_files()`, `get_thread_file_path()`, `load_thread_file()`,
-  - với KB Mongo thì dùng `load_kb_collection()`, `get_kb_collection_schema()`, `list_kb_collections()`.
+### Với câu hỏi khái niệm hoặc tổng hợp kiến thức
+- Trả lời dựa trên reasoning chung, không cần code.
+- Liên hệ đến context file/KB nếu có liên quan.
+
+## Sinh Python Code
+
+Khi sinh code:
+1. **Bọc trong fenced code block** (```python).
+2. **Ưu tiên helper có sẵn**:
+   - Với file upload: `list_thread_files()`, `load_thread_file()`, `get_thread_file_path()`.
+   - Với KB Mongo: `list_kb_collections()`, `load_kb_collection()`, `get_kb_collection_schema()`.
+3. **Alias sẵn có**: `pd`, `np`, `plt`, `sns`, `px`, `go`, `json`, `re`, `os`, `Path`, `Counter`.
+4. **Không hard-code đường dẫn** - Luôn dùng helper.
+
+## Vẽ biểu đồ
+
+### Trước khi code
+- **Chọn loại biểu đồ** dựa trên bài toán (xem Skills → data_visualization).
+- **Giải thích lý do chọn** loại biểu đồ, không chỉ vẽ mà không nói.
+- **Chọn bảng màu** phù hợp với dữ liệu.
+
+### Sau khi code chạy xong
+- **Nhận xét kết quả**: Insight chính, điểm cần lưu ý, gợi ý cải thiện.
+- **Kiểm tra biểu đồ**: Trục, đơn vị, chú giải, màu, scale, outlier, số lượng mẫu.
+- **Cảnh báo** nếu có nguy cơ hiểu sai → Đề xuất sửa.
+
+### Không được
+- Nhận xét biểu đồ **trước khi vẽ xong** (trừ nhận xét logic có thể suy ra từ dữ liệu).
+- Vẽ biểu đồ "bừa" mà không giải thích.
+
+## Lưu trữ và Metadata
+
+### File và Media
+- Mỗi file/ảnh phải gắn với `thread_id` đúng.
+- **Metadata**: Lưu trong Firestore.
+- **Media**: Ưu tiên MongoDB GridFS; nếu lỗi → fallback local cache.
+- **Không dual-write** cùng asset vào nhiều backend.
+
+### Image History
+- Chỉ lưu ảnh **thực sự từ code execution**, không lẫn file upload thường.
+- Ảnh mới nhất → khung "Latest chart / execution image".
+- Tất cả lịch sử → Gallery sidebar (lưới 2 cột, cuộn dọc nếu cần).
 
 ## Kiểm soát chất lượng
-- Không kết luận mạnh nếu dữ liệu chỉ là sample nhỏ, có missing values nhiều hoặc không rõ đơn vị.
-- Khi nhận xét biểu đồ, luôn kiểm tra: tiêu đề, trục, đơn vị, chú giải, màu, scale, outlier, số lượng mẫu.
-- Nếu biểu đồ có nguy cơ gây hiểu sai, phải đề xuất cách sửa cụ thể.
+
+### Khi làm việc với dữ liệu
+- **Không kết luận mạnh** nếu:
+  - Sample quá nhỏ hoặc không đại diện.
+  - Có quá nhiều missing values.
+  - Không rõ đơn vị hoặc định nghĩa cột.
+- **Kiểm tra cơ bản**: Kiểu dữ liệu, missing values, duplicate, range hợp lý.
+
+### Khi trả lời từ nhiều nguồn
+- Nêu rõ **nguồn nào xác nhận nội dung nào**.
+- Nếu mâu thuẫn → Giải thích sự khác biệt.
+
+### Khi dữ liệu thiếu
+- Báo rõ **nguyên nhân thực tế**, không mơ hồ.
+- Gợi ý **cách bổ sung** (thêm file, lấy data khác, etc.).

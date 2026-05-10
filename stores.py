@@ -220,6 +220,7 @@ class FirebaseStore:
             "code": thread.get("code", ""),
             "code_status": thread.get("code_status", ""),
             "exec_output": thread.get("exec_output", ""),
+            "thinking": thread.get("thinking", ""),
             "error": thread.get("error", ""),
             "created_at": thread.get("created_at", ""),
             "updated_at": thread.get("updated_at", ""),

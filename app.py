@@ -190,6 +190,19 @@ APP_CSS = """
 .image-history-grid .grid-wrap {
     gap: 8px;
 }
+.thinking-box {
+    background-color: #1a1a1a !important;
+    color: #00ff00 !important;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace !important;
+    font-size: 13px !important;
+    border: 1px solid #444 !important;
+    border-radius: 8px !important;
+}
+.thinking-box textarea {
+    background-color: #1a1a1a !important;
+    color: #00ff00 !important;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace !important;
+}
 """
 
 
@@ -347,6 +360,7 @@ def build_instruction_catalog() -> Dict[str, Dict[str, str]]:
         "data_visualization": SKILLS_DIR / "data_visualization.md",
         "document_reasoning": SKILLS_DIR / "document_reasoning.md",
         "general_assistant": SKILLS_DIR / "general_assistant.md",
+        "external_data_handling": SKILLS_DIR / "external_data_handling.md",
         "chatbox_tools": TOOLS_DIR / "chatbox_tools.md",
         "storage_backends": TOOLS_DIR / "storage_backends.md",
     }
@@ -391,11 +405,26 @@ def select_instruction_keys(user_text: str) -> List[str]:
         "tập tin",
         "ảnh",
     ]
+    external_data_markers = [
+        "web",
+        "scrape",
+        "api",
+        "crawl",
+        "fetch",
+        "request",
+        "url",
+        "website",
+        "data source",
+        "nguồn dữ liệu",
+        "cào dữ liệu",
+    ]
 
     if any(marker in lowered for marker in data_viz_markers):
         keys.append("data_visualization")
     if any(marker in lowered for marker in document_markers):
         keys.append("document_reasoning")
+    if any(marker in lowered for marker in external_data_markers):
+        keys.append("external_data_handling")
     if "storage" in lowered or "firebase" in lowered or "mongo" in lowered:
         keys.append("storage_backends")
     if len(keys) == 2:
@@ -770,6 +799,7 @@ def build_thread(title: str, order_index: int) -> Dict[str, Any]:
         "uploaded_files": [],
         "image_history": [],
         "last_exec_image_asset_id": "",
+        "thinking": "",
         "error": "",
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -808,6 +838,7 @@ def normalize_thread(raw_thread: Dict[str, Any], fallback_order_index: int) -> D
         "uploaded_files": list(raw_thread.get("uploaded_files", [])),
         "image_history": list(raw_thread.get("image_history", [])),
         "last_exec_image_asset_id": str(raw_thread.get("last_exec_image_asset_id", "")),
+        "thinking": str(raw_thread.get("thinking", "")),
         "error": str(raw_thread.get("error", "")),
         "created_at": created_at,
         "updated_at": updated_at,
@@ -1111,7 +1142,7 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, str, gr.Dropdown]:
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -1120,6 +1151,7 @@ def get_thread_payload(
         get_current_exec_image(thread),
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
+        thread.get("thinking", ""),
         thread.get("error", ""),
         gr.update(choices=build_file_download_choices(thread), value=None),
     )
@@ -1148,7 +1180,7 @@ def select_thread(
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
     
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = get_thread_payload(thread)
     
     return (
         state,
@@ -1160,6 +1192,7 @@ def select_thread(
         exec_image,
         image_gallery,
         file_html,
+        thinking,
         error,
         "",
         gr.update(value=None),
@@ -1201,6 +1234,7 @@ def new_thread(
         None,
         [],
         render_uploaded_files_html(thread),
+        "",
         thread.get("error", ""),
         "",
         gr.update(value=None),
@@ -1266,7 +1300,7 @@ def handle_chat(
 
     uploaded_paths = [str(path) for path in (upload_paths or []) if str(path).strip()]
     if not normalize_text_block(message) and not uploaded_paths:
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1279,6 +1313,7 @@ def handle_chat(
             exec_image,
             image_gallery,
             file_html,
+            thinking,
             error,
             "",
             gr.update(value=None),
@@ -1316,7 +1351,7 @@ def handle_chat(
     if not client:
         thread["error"] = merge_errors("Missing GEMINI_API_KEY", upload_error)
         persist_thread(state, state["active_id"], touch=True)
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1329,6 +1364,7 @@ def handle_chat(
             exec_image,
             image_gallery,
             file_html,
+            thinking,
             error,
             "",
             gr.update(value=None),
@@ -1339,12 +1375,18 @@ def handle_chat(
         response = client.models.generate_content(
             model=config.get("model", DEFAULT_MODEL),
             contents=contents,
-            config={"system_instruction": system_prompt},
+            config={
+                "system_instruction": system_prompt,
+            },
         )
         bot_text = response.text or ""
+        thinking_text = ""
+        if hasattr(response, "thinking") and response.thinking:
+            thinking_text = response.thinking
         error_message = ""
     except Exception as exc:
         bot_text = f"Error: {exc}"
+        thinking_text = ""
         error_message = str(exc)
 
     history = thread["messages"]
@@ -1357,6 +1399,7 @@ def handle_chat(
     thread["code_status"] = status
     thread["exec_output"] = ""
     thread["exec_image_temp_path"] = None
+    thread["thinking"] = thinking_text
     thread["error"] = merge_errors(error_message, upload_error)
 
     store.log_event(
@@ -1381,7 +1424,7 @@ def handle_chat(
 
     persist_thread(state, state["active_id"], touch=True)
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
         get_thread_payload(thread)
     )
     return (
@@ -1394,6 +1437,7 @@ def handle_chat(
         exec_image,
         image_gallery,
         file_html,
+        thinking,
         error,
         "",
         gr.update(value=None),
@@ -1599,7 +1643,7 @@ def load_app_state() -> Tuple[
 ]:
     state = load_state()
     thread = state["threads"][state["active_id"]]
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
         state,
@@ -1611,6 +1655,7 @@ def load_app_state() -> Tuple[
         exec_image,
         image_gallery,
         file_html,
+        thinking,
         thread["error"],
         "",
         gr.update(value=None),
@@ -1721,6 +1766,13 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
                 approve_btn = gr.Button("Approve and run")
                 exec_output = gr.Textbox(label="Execution output", interactive=False)
                 exec_image = gr.Image(label="Latest chart / execution image")
+                thinking_box = gr.Textbox(
+                    label="API Thinking Process",
+                    interactive=False,
+                    lines=6,
+                    elem_classes=["thinking-box"],
+                    max_lines=10,
+                )
                 error_box = gr.Textbox(label="Error", interactive=False, lines=4)
 
             with gr.Group(visible=False) as model_page:
@@ -1738,6 +1790,7 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
         exec_image,
         image_history,
         file_history,
+        thinking_box,
         error_box,
         message,
         upload_ctx,
