@@ -347,6 +347,7 @@ def build_instruction_catalog() -> Dict[str, Dict[str, str]]:
         "data_visualization": SKILLS_DIR / "data_visualization.md",
         "document_reasoning": SKILLS_DIR / "document_reasoning.md",
         "general_assistant": SKILLS_DIR / "general_assistant.md",
+        "external_data_handling": SKILLS_DIR / "external_data_handling.md",
         "chatbox_tools": TOOLS_DIR / "chatbox_tools.md",
         "storage_backends": TOOLS_DIR / "storage_backends.md",
     }
@@ -358,7 +359,6 @@ def build_instruction_catalog() -> Dict[str, Dict[str, str]]:
         if text:
             catalog[key] = {"path": str(path), "content": text}
     return catalog
-
 
 INSTRUCTION_CATALOG = build_instruction_catalog()
 
@@ -391,11 +391,26 @@ def select_instruction_keys(user_text: str) -> List[str]:
         "tập tin",
         "ảnh",
     ]
+    external_data_markers = [
+        "web",
+        "scrape",
+        "api",
+        "crawl",
+        "fetch",
+        "request",
+        "url",
+        "website",
+        "data source",
+        "nguồn dữ liệu",
+        "cào dữ liệu",
+    ]
 
     if any(marker in lowered for marker in data_viz_markers):
         keys.append("data_visualization")
     if any(marker in lowered for marker in document_markers):
         keys.append("document_reasoning")
+    if any(marker in lowered for marker in external_data_markers):
+        keys.append("external_data_handling")
     if "storage" in lowered or "firebase" in lowered or "mongo" in lowered:
         keys.append("storage_backends")
     if len(keys) == 2:
