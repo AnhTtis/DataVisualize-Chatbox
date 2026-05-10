@@ -131,7 +131,6 @@ class FirebaseStore:
         self.credentials_path = resolve_local_path(os.getenv("FIREBASE_CREDENTIALS_JSON"))
         self.database_id = os.getenv("FIREBASE_DATABASE_ID", "(default)")
         self.chat_namespace = os.getenv("FIREBASE_CHAT_NAMESPACE", "default")
-        self.media_fallback_dir = (Path(__file__).resolve().parent / "artifacts" / "chatbox_cache" / "media_fallback")
         self.enabled = bool(self.project_id and self.credentials_path)
         self.last_error = ""
         self._mongo_media_client = None
@@ -330,39 +329,6 @@ class FirebaseStore:
             asset.update(metadata)
         return asset
 
-    def _save_media_to_local_cache(
-        self,
-        thread_id: str,
-        filename: str,
-        data: bytes,
-        content_type: str,
-        kind: str,
-        source: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        safe_name = Path(filename or "").name or f"{kind}-{uuid4().hex}"
-        asset_id = uuid4().hex
-        target_dir = self.media_fallback_dir / self.chat_namespace / (thread_id or "thread") / source
-        target_dir.mkdir(parents=True, exist_ok=True)
-        local_name = f"{asset_id}_{safe_name}"
-        local_path = target_dir / local_name
-        local_path.write_bytes(data)
-
-        asset = {
-            "asset_id": asset_id,
-            "name": safe_name,
-            "kind": kind,
-            "source": source,
-            "content_type": content_type,
-            "size_bytes": len(data),
-            "storage_backend": "local_cache",
-            "local_path": str(local_path),
-            "created_at": utc_now_iso(),
-        }
-        if metadata:
-            asset.update(metadata)
-        return asset
-
     def save_media(
         self,
         thread_id: str,
@@ -391,31 +357,10 @@ class FirebaseStore:
             )
             self.last_error = ""
             return asset
-        except Exception as exc:
-            mongo_error = str(exc).strip() or "MongoDB GridFS unavailable."
-            if KB_ENABLE_TIMING_LOGS:
-                print(mongo_error)
-
-        try:
-            asset = self._save_media_to_local_cache(
-                thread_id=thread_id,
-                filename=filename,
-                data=data,
-                content_type=content_type,
-                kind=kind,
-                source=source,
-                metadata=metadata,
-            )
-            self.last_error = (
-                "MongoDB GridFS unavailable. Media was cached locally for UI continuity."
-            )
-            return asset
         except Exception:
-            local_error = traceback.format_exc().strip()
-            combined = "\n\n".join(part for part in [mongo_error, local_error] if part)
-            self.last_error = combined
+            self.last_error = traceback.format_exc()
             if KB_ENABLE_TIMING_LOGS:
-                print(combined)
+                print(self.last_error)
             return None
 
     def load_media_bytes(
@@ -439,17 +384,6 @@ class FirebaseStore:
                 bucket = GridFSBucket(db, bucket_name="chat_media")
                 stream = bucket.open_download_stream(ObjectId(gridfs_file_id))
                 data = stream.read()
-                self.last_error = ""
-                return data
-
-            if backend == "local_cache":
-                local_path = normalize_text_block(asset.get("local_path", ""))
-                if not local_path:
-                    raise RuntimeError("Missing local cache path.")
-                path = Path(local_path)
-                if not path.exists():
-                    raise RuntimeError(f"Local cache file does not exist: {local_path}")
-                data = path.read_bytes()
                 self.last_error = ""
                 return data
 

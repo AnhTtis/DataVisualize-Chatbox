@@ -39,9 +39,6 @@ SECRETS_DIR = APP_ROOT / "secrets"
 DOCS_DIR = APP_ROOT / "docs"
 SKILLS_DIR = DOCS_DIR / "skills"
 TOOLS_DIR = DOCS_DIR / "tools"
-CACHE_DIR = APP_ROOT / "artifacts" / "chatbox_cache"
-UPLOAD_CACHE_DIR = CACHE_DIR / "uploads"
-MEDIA_CACHE_DIR = CACHE_DIR / "media"
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 AUTO_INSTALL_WHITELIST = os.getenv("AUTO_INSTALL_WHITELIST", "0") == "1"
@@ -109,25 +106,78 @@ APP_CSS = """
 .file-history {
   max-height: 240px;
   overflow-y: auto;
-  display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .file-chip {
   border: 1px solid #d9e1ef;
-  border-radius: 10px;
-  padding: 8px 10px;
+  border-radius: 8px;
+  padding: 10px 12px;
   background: white;
-    min-width: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  box-sizing: border-box;
+  position: relative;
+  transition: all 0.2s ease;
+}
+.file-chip:hover {
+  background: #f5f8ff;
+  border-color: #a8d8ff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+.file-chip-info {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
 }
 .file-chip strong {
   display: block;
-  margin-bottom: 2px;
-    font-size: 12px;
+  margin: 0;
+  font-size: 13px;
+  word-break: break-word;
 }
 .file-chip small {
   color: #5d6b82;
-    font-size: 11px;
+  font-size: 12px;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+.file-chip-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: 10px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.file-chip:hover .file-chip-actions {
+  opacity: 1;
+}
+.file-action-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #5d6b82;
+  transition: color 0.2s ease;
+  border-radius: 4px;
+}
+.file-action-btn:hover {
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+}
+.file-action-btn.download:hover {
+  color: #059669;
+}
+.file-action-btn.download:hover {
+  background: rgba(5, 150, 105, 0.1);
 }
 .image-history-grid {
     border: 1px solid #d7dde8;
@@ -847,12 +897,8 @@ def materialize_thread_upload(thread: Dict[str, Any], file_ref: str) -> str:
     if item is None:
         raise FileNotFoundError(f"No uploaded file matched '{file_ref}'.")
 
-    cache_dir = ensure_directory(MEDIA_CACHE_DIR / thread.get("thread_id", "default"))
     filename = item.get("name") or f"{item.get('asset_id', uuid4().hex)}.bin"
-    target_path = cache_dir / filename
-    if target_path.exists():
-        return str(target_path)
-
+    
     data = store.load_media_bytes(
         item,
         mongo_uri_template=DEFAULT_MONGODB_URI_TEMPLATE,
@@ -861,8 +907,12 @@ def materialize_thread_upload(thread: Dict[str, Any], file_ref: str) -> str:
     )
     if data is None:
         raise RuntimeError(format_store_error() or f"Could not load stored bytes for '{filename}'.")
-    target_path.write_bytes(data)
-    return str(target_path)
+    
+    # Create temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+    temp_file.write(data)
+    temp_file.close()
+    return temp_file.name
 
 
 def load_thread_file_value(thread: Dict[str, Any], file_ref: str) -> Any:
@@ -922,32 +972,128 @@ def get_current_exec_image(thread: Dict[str, Any]) -> Optional[Any]:
     return None
 
 
+def build_uploaded_files_gallery(thread: Dict[str, Any]) -> List[Tuple[Any, str]]:
+    """Build file list gallery with download support."""
+    gallery: List[Tuple[Any, str]] = []
+    files = thread.get("uploaded_files", [])
+    for item in reversed(files):
+        name = item.get("name", "unnamed")
+        size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
+        content_type = item.get("content_type", "unknown")
+        label = f"{name} ({size_text}) - {content_type}"
+        gallery.append((name, label))
+    return gallery
+
+
+def build_file_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Build choices for file download dropdown."""
+    choices: List[Tuple[str, str]] = []
+    files = thread.get("uploaded_files", [])
+    for item in reversed(files):
+        name = item.get("name", "unnamed")
+        size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
+        asset_id = item.get("asset_id", "")
+        value = asset_id or name
+        label = f"{name} ({size_text})"
+        choices.append((label, value))
+    return choices
+
+
+def download_file(
+    state: Dict[str, Any],
+    file_ref: str,
+) -> Optional[str]:
+    """Download selected file and return path for download."""
+    if not file_ref or not state.get("active_id"):
+        return None
+    
+    thread = state["threads"].get(state["active_id"])
+    if not thread:
+        return None
+    
+    try:
+        file_path = materialize_thread_upload(thread, file_ref)
+        return file_path
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return None
+
+
 def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
     files = thread.get("uploaded_files", [])
     if not files:
         return (
             "<div class='sidebar-card'><div class='file-history'>"
-            "<div class='file-chip'><strong>Chưa có file</strong><small>Các file bạn upload sẽ hiện ở đây theo từng chat.</small></div>"
+            "<div class='file-chip'><div class='file-chip-info'><strong>Chưa có file</strong></div></div>"
             "</div></div>"
         )
 
     cards: List[str] = []
     for item in reversed(files):
         name = item.get("name", "unnamed")
-        content_type = item.get("content_type", "unknown")
         size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
-        backend = item.get("storage_backend", "not-persisted")
-        excerpt = item.get("text_excerpt", "")
-        excerpt_block = f"<small>{html.escape(trim_text(excerpt, 180))}</small>" if excerpt else ""
+        asset_id = item.get("asset_id", "")
+        file_ref = asset_id or name
+        
         cards.append(
-            "<div class='file-chip'>"
+            "<div class='file-chip' data-file-ref='" + html.escape(file_ref) + "' data-file-name='" + html.escape(name) + "'>"
+            "<div class='file-chip-info'>"
             f"<strong>{html.escape(name)}</strong>"
-            f"<small>{html.escape(content_type)} | {html.escape(size_text)} | {html.escape(backend)}</small>"
-            f"{excerpt_block}"
+            f"<small>{html.escape(size_text)}</small>"
+            "</div>"
+            "<div class='file-chip-actions'>"
+            f"<button class='file-action-btn download' onclick='triggerFileDownload(this)' type='button' title='Download'>⬇️</button>"
+            "</div>"
             "</div>"
         )
 
-    return f"<div class='sidebar-card'><div class='file-history'>{''.join(cards)}</div></div>"
+    html_content = f"<div class='sidebar-card'><div class='file-history'>{''.join(cards)}</div></div>"
+    
+    # Add JavaScript handler for triggering downloads
+    js_script = """
+    <script>
+    window.triggerFileDownload = function(btn) {
+        const fileRef = btn.getAttribute('data-file-ref');
+        const fileName = btn.getAttribute('data-file-name');
+        if (!fileRef) return;
+        
+        // Create a simple link and simulate download
+        // Find all inputs in the page and look for our trigger textbox
+        const inputs = document.querySelectorAll('input[type="text"]');
+        let triggerFound = false;
+        
+        for (let inp of inputs) {
+            // Check if this might be our textbox by looking at nearby labels or structure
+            const parent = inp.closest('[data-testid]') || inp.closest('div');
+            if (parent && parent.querySelector('label') && parent.querySelector('label').textContent === '') {
+                // Try to trigger change on this textbox
+                inp.value = fileRef;
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                triggerFound = true;
+                break;
+            }
+        }
+        
+        if (!triggerFound) {
+            // Fallback: look for all textboxes and try setting value
+            const textboxes = document.querySelectorAll('input[type="text"]');
+            if (textboxes.length > 0) {
+                // Try the first hidden/invisible textbox
+                for (let tb of textboxes) {
+                    if (tb.offsetParent === null || tb.style.display === 'none') {
+                        tb.value = fileRef;
+                        tb.dispatchEvent(new Event('change', { bubbles: true }));
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    </script>
+    """
+    
+    return html_content + js_script
 
 
 # def build_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -965,7 +1111,7 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown]:
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -975,7 +1121,7 @@ def get_thread_payload(
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        # gr.update(choices=build_download_choices(thread), value=None),
+        gr.update(choices=build_file_download_choices(thread), value=None),
     )
 
 
@@ -1002,12 +1148,8 @@ def select_thread(
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
     
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
-         get_thread_payload(thread)
-    )
-    # messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, download_choices = (
-    #     get_thread_payload(thread)
-    # )
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
+    
     return (
         state,
         refresh_thread_list(state),
@@ -1019,9 +1161,9 @@ def select_thread(
         image_gallery,
         file_html,
         error,
-        # download_choices,
         "",
         gr.update(value=None),
+        file_download_choices,
     )
 
 
@@ -1060,9 +1202,9 @@ def new_thread(
         [],
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        # gr.update(choices=build_download_choices(thread), value=None),
         "",
         gr.update(value=None),
+        gr.update(choices=build_file_download_choices(thread), value=None),
     )
 
 
@@ -1124,7 +1266,7 @@ def handle_chat(
 
     uploaded_paths = [str(path) for path in (upload_paths or []) if str(path).strip()]
     if not normalize_text_block(message) and not uploaded_paths:
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1138,9 +1280,9 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            # download_choices,
             "",
             gr.update(value=None),
+            file_download_choices,
         )
 
     saved_attachments, current_upload_blocks, attachment_parts, upload_error = process_uploaded_files(
@@ -1174,7 +1316,7 @@ def handle_chat(
     if not client:
         thread["error"] = merge_errors("Missing GEMINI_API_KEY", upload_error)
         persist_thread(state, state["active_id"], touch=True)
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1188,9 +1330,9 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            # download_choices,
             "",
             gr.update(value=None),
+            file_download_choices,
         )
 
     try:
@@ -1239,7 +1381,7 @@ def handle_chat(
 
     persist_thread(state, state["active_id"], touch=True)
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = (
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
         get_thread_payload(thread)
     )
     return (
@@ -1253,9 +1395,9 @@ def handle_chat(
         image_gallery,
         file_html,
         error,
-        #  download_choices,
         "",
         gr.update(value=None),
+        file_download_choices,
     )
 
 
@@ -1457,7 +1599,7 @@ def load_app_state() -> Tuple[
 ]:
     state = load_state()
     thread = state["threads"][state["active_id"]]
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error = get_thread_payload(thread)
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
         state,
@@ -1472,6 +1614,7 @@ def load_app_state() -> Tuple[
         thread["error"],
         "",
         gr.update(value=None),
+        file_download_choices,
     )
 
 
@@ -1549,6 +1692,17 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
 
             gr.Markdown("### Uploaded files")
             file_history = gr.HTML(render_uploaded_files_html(build_thread("Chat 1", 0)))
+            
+            file_download_trigger = gr.Textbox(visible=False, interactive=False)
+            file_download_select = gr.Dropdown(
+                label="Select file to download",
+                choices=[],
+                interactive=True,
+                visible=False,
+            )
+            file_download_btn = gr.Button("📥 Download", visible=False, scale=1)
+            
+            file_download_output = gr.File(label="Downloaded file", interactive=False)
 
             mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
             mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
@@ -1587,6 +1741,7 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
         error_box,
         message,
         upload_ctx,
+        file_download_select,
     ]
     demo.load(fn=load_app_state, outputs=load_outputs)
 
@@ -1606,17 +1761,26 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
     send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
     message.submit(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
 
+    file_download_btn.click(
+        fn=download_file,
+        inputs=[state, file_download_select],
+        outputs=file_download_output,
+    )
+
     approve_btn.click(
         fn=approve_code,
         inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name],
         outputs=[state, exec_output, exec_image, code_status, image_history, error_box],
     )
 
+    file_download_trigger.change(
+        fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None,
+        inputs=[file_download_trigger, state],
+        outputs=file_download_output,
+    )
+
 
 if __name__ == "__main__":
-    ensure_directory(CACHE_DIR)
-    ensure_directory(UPLOAD_CACHE_DIR)
-    ensure_directory(MEDIA_CACHE_DIR)
     preinstall_whitelist()
     try:
         knowledge_base._connect(
