@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import traceback
 import zipfile
 import xml.etree.ElementTree as ET
@@ -29,6 +30,9 @@ from stores import (
     MongoKnowledgeBase,
     SEARCH_TOKEN_PATTERN,
     build_mongodb_uri,
+    normalize_text_block,
+    tokenize_search_text,
+    log_kb_timing,
 )
 
 load_dotenv()
@@ -190,28 +194,11 @@ APP_CSS = """
 .image-history-grid .grid-wrap {
     gap: 8px;
 }
-.thinking-box {
-    background-color: #1a1a1a !important;
-    color: #00ff00 !important;
-    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace !important;
-    font-size: 13px !important;
-    border: 1px solid #444 !important;
-    border-radius: 8px !important;
-}
-.thinking-box textarea {
-    background-color: #1a1a1a !important;
-    color: #00ff00 !important;
-    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace !important;
-}
 """
 
 
 def now_ts() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def normalize_text_block(text: Any) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def trim_text(text: str, limit: int) -> str:
@@ -220,17 +207,6 @@ def trim_text(text: str, limit: int) -> str:
         return text
     hidden = len(text) - limit
     return f"{text[:limit].rstrip()}... [truncated {hidden} chars]"
-
-
-def tokenize_search_text(text: str) -> List[str]:
-    tokens = [token.lower() for token in SEARCH_TOKEN_PATTERN.findall(text)]
-    return [token for token in tokens if len(token) > 1]
-
-
-def log_kb_timing(operation: str, duration_ms: float, details: str = "") -> None:
-    if KB_ENABLE_TIMING_LOGS:
-        suffix = f" ({details})" if details else ""
-        print(f"[KB TIMING] {operation}: {duration_ms:.1f}ms{suffix}")
 
 
 def merge_errors(*messages: str) -> str:
@@ -729,6 +705,7 @@ def process_uploaded_files(
         extracted_text = extract_text_from_upload(str(path))
         asset = store.save_media(
             thread_id=thread.get("thread_id", ""),
+            thread_key=thread.get("thread_key", ""),
             filename=path.name,
             data=data,
             content_type=mime_type,
@@ -790,6 +767,7 @@ def build_thread(title: str, order_index: int) -> Dict[str, Any]:
     timestamp = now_ts()
     return {
         "thread_id": "",
+        "thread_key": f"thread_{uuid4().hex[:12]}",  # Stable internal identifier
         "title": title,
         "messages": [],
         "code": "",
@@ -799,7 +777,7 @@ def build_thread(title: str, order_index: int) -> Dict[str, Any]:
         "uploaded_files": [],
         "image_history": [],
         "last_exec_image_asset_id": "",
-        "thinking": "",
+        "chart_counter": 0,  # Counter for sequential chart naming
         "error": "",
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -826,9 +804,19 @@ def normalize_thread(raw_thread: Dict[str, Any], fallback_order_index: int) -> D
         order_index = int(raw_thread.get("order_index", fallback_order_index))
     except (TypeError, ValueError):
         order_index = fallback_order_index
+    try:
+        chart_counter = int(raw_thread.get("chart_counter", 0))
+    except (TypeError, ValueError):
+        chart_counter = 0
+
+    # Ensure thread_key exists for backward compatibility
+    thread_key = str(raw_thread.get("thread_key", ""))
+    if not thread_key:
+        thread_key = f"thread_{uuid4().hex[:12]}"
 
     return {
         "thread_id": str(raw_thread.get("thread_id") or ""),
+        "thread_key": thread_key,
         "title": str(raw_thread.get("title") or f"Chat {fallback_order_index + 1}"),
         "messages": messages,
         "code": str(raw_thread.get("code", "")),
@@ -838,7 +826,7 @@ def normalize_thread(raw_thread: Dict[str, Any], fallback_order_index: int) -> D
         "uploaded_files": list(raw_thread.get("uploaded_files", [])),
         "image_history": list(raw_thread.get("image_history", [])),
         "last_exec_image_asset_id": str(raw_thread.get("last_exec_image_asset_id", "")),
-        "thinking": str(raw_thread.get("thinking", "")),
+        "chart_counter": chart_counter,
         "error": str(raw_thread.get("error", "")),
         "created_at": created_at,
         "updated_at": updated_at,
@@ -895,12 +883,14 @@ def short_thread_id(thread_id: str) -> str:
 
 
 def list_threads(state: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """List threads with only title displayed, no internal keys shown to user."""
     choices: List[Tuple[str, str]] = []
     for thread_id in state["order"]:
         thread = state["threads"].get(thread_id)
         if not thread:
             continue
-        label = f"{thread.get('title', 'Untitled')} ({short_thread_id(thread_id)})"
+        # Display only title, hide internal thread_key and thread_id from user
+        label = thread.get('title', 'Untitled')
         choices.append((label, thread_id))
     return choices
 
@@ -1080,69 +1070,12 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
 
     html_content = f"<div class='sidebar-card'><div class='file-history'>{''.join(cards)}</div></div>"
     
-    # Add JavaScript handler for triggering downloads
-    js_script = """
-    <script>
-    window.triggerFileDownload = function(btn) {
-        const fileRef = btn.getAttribute('data-file-ref');
-        const fileName = btn.getAttribute('data-file-name');
-        if (!fileRef) return;
-        
-        // Create a simple link and simulate download
-        // Find all inputs in the page and look for our trigger textbox
-        const inputs = document.querySelectorAll('input[type="text"]');
-        let triggerFound = false;
-        
-        for (let inp of inputs) {
-            // Check if this might be our textbox by looking at nearby labels or structure
-            const parent = inp.closest('[data-testid]') || inp.closest('div');
-            if (parent && parent.querySelector('label') && parent.querySelector('label').textContent === '') {
-                // Try to trigger change on this textbox
-                inp.value = fileRef;
-                inp.dispatchEvent(new Event('change', { bubbles: true }));
-                inp.dispatchEvent(new Event('input', { bubbles: true }));
-                triggerFound = true;
-                break;
-            }
-        }
-        
-        if (!triggerFound) {
-            // Fallback: look for all textboxes and try setting value
-            const textboxes = document.querySelectorAll('input[type="text"]');
-            if (textboxes.length > 0) {
-                // Try the first hidden/invisible textbox
-                for (let tb of textboxes) {
-                    if (tb.offsetParent === null || tb.style.display === 'none') {
-                        tb.value = fileRef;
-                        tb.dispatchEvent(new Event('change', { bubbles: true }));
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    </script>
-    """
-    
-    return html_content + js_script
-
-
-# def build_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]:
-#     choices: List[Tuple[str, str]] = []
-#     files = thread.get("uploaded_files", [])
-#     for item in reversed(files):
-#         name = item.get("name", "unnamed")
-#         size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
-#         asset_id = item.get("asset_id", "")
-#         value = asset_id or name
-#         label = f"{name} ({size_text})"
-#         choices.append((label, value))
-#     return choices
+    return html_content
 
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, str, gr.Dropdown]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown]:
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -1151,7 +1084,6 @@ def get_thread_payload(
         get_current_exec_image(thread),
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
-        thread.get("thinking", ""),
         thread.get("error", ""),
         gr.update(choices=build_file_download_choices(thread), value=None),
     )
@@ -1171,8 +1103,6 @@ def select_thread(
     List[Tuple[Any, str]],
     str,
     str,
-    # gr.Dropdown,
-    str,
     Any,
 ]:
     if not thread_id or thread_id not in state["threads"]:
@@ -1180,7 +1110,7 @@ def select_thread(
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
     
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = get_thread_payload(thread)
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
     
     return (
         state,
@@ -1192,7 +1122,6 @@ def select_thread(
         exec_image,
         image_gallery,
         file_html,
-        thinking,
         error,
         "",
         gr.update(value=None),
@@ -1202,6 +1131,7 @@ def select_thread(
 
 def new_thread(
     state: Dict[str, Any],
+    title: str = "",
 ) -> Tuple[
     Dict[str, Any],
     gr.Dropdown,
@@ -1213,17 +1143,31 @@ def new_thread(
     List[Tuple[Any, str]],
     str,
     str,
-    # gr.Dropdown,
     str,
+    Any,
     Any,
 ]:
     thread_id = make_thread_id()
-    thread = build_thread(title=f"Chat {len(state['order']) + 1}", order_index=len(state["order"]))
+    # If title provided, use it. Otherwise leave empty - will be auto-generated from first query
+    final_title = normalize_text_block(title).strip() if title else ""
+    thread = build_thread(title=final_title, order_index=len(state["order"]))
     thread["thread_id"] = thread_id
     state["threads"][thread_id] = thread
     state["order"].append(thread_id)
     state["active_id"] = thread_id
-    persist_thread(state, thread_id)
+    
+    # Fire-and-forget: Persist to database in background (don't block UI)
+    def _async_persist():
+        try:
+            persist_thread(state, thread_id)
+        except Exception as e:
+            if KB_ENABLE_TIMING_LOGS:
+                print(f"[NEW THREAD BG] Database persist error: {e}")
+    
+    persist_thread_obj = threading.Thread(target=_async_persist, daemon=True)
+    persist_thread_obj.start()
+    
+    # Return IMMEDIATELY - UI updates fast, DB saves in background
     return (
         state,
         refresh_thread_list(state),
@@ -1235,23 +1179,11 @@ def new_thread(
         [],
         render_uploaded_files_html(thread),
         "",
-        thread.get("error", ""),
         "",
         gr.update(value=None),
         gr.update(choices=build_file_download_choices(thread), value=None),
+        # gr.update(visible=True, value=thread.get("title", "")),
     )
-
-
-def maybe_update_thread_title(thread: Dict[str, Any], message: str) -> None:
-    title = normalize_text_block(message)
-    if not title:
-        return
-    if thread.get("messages"):
-        return
-    current_title = thread.get("title", "")
-    if not current_title.startswith("Chat "):
-        return
-    thread["title"] = trim_text(title, 48)
 
 
 def build_user_text(
@@ -1291,7 +1223,6 @@ def handle_chat(
     List[Tuple[Any, str]],
     str,
     str,
-    # gr.Dropdown,
     str,
     Any,
 ]:
@@ -1300,7 +1231,7 @@ def handle_chat(
 
     uploaded_paths = [str(path) for path in (upload_paths or []) if str(path).strip()]
     if not normalize_text_block(message) and not uploaded_paths:
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1313,7 +1244,6 @@ def handle_chat(
             exec_image,
             image_gallery,
             file_html,
-            thinking,
             error,
             "",
             gr.update(value=None),
@@ -1330,12 +1260,17 @@ def handle_chat(
     if saved_attachments:
         thread["uploaded_files"].extend(saved_attachments)
 
+    # Auto-generate title from first query if not already set
+    if not normalize_text_block(thread.get("title", "")):
+        # Trim first query to create title
+        auto_title = trim_text(message.strip(), 48) if message.strip() else f"Chat {len(state['order'])}"
+        thread["title"] = auto_title
+
     thread_upload_context = build_thread_upload_context(
         thread,
         exclude_asset_ids={item.get("asset_id", "") for item in saved_attachments},
     )
     user_text = build_user_text(message, current_upload_blocks, thread_upload_context)
-    maybe_update_thread_title(thread, message or "Files uploaded")
 
     knowledge_base_context, knowledge_base_status, knowledge_base_documents = lookup_knowledge_base(
         query_text=user_text,
@@ -1351,7 +1286,7 @@ def handle_chat(
     if not client:
         thread["error"] = merge_errors("Missing GEMINI_API_KEY", upload_error)
         persist_thread(state, state["active_id"], touch=True)
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
+        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
             get_thread_payload(thread)
         )
         return (
@@ -1364,7 +1299,6 @@ def handle_chat(
             exec_image,
             image_gallery,
             file_html,
-            thinking,
             error,
             "",
             gr.update(value=None),
@@ -1380,13 +1314,9 @@ def handle_chat(
             },
         )
         bot_text = response.text or ""
-        thinking_text = ""
-        if hasattr(response, "thinking") and response.thinking:
-            thinking_text = response.thinking
         error_message = ""
     except Exception as exc:
         bot_text = f"Error: {exc}"
-        thinking_text = ""
         error_message = str(exc)
 
     history = thread["messages"]
@@ -1399,7 +1329,6 @@ def handle_chat(
     thread["code_status"] = status
     thread["exec_output"] = ""
     thread["exec_image_temp_path"] = None
-    thread["thinking"] = thinking_text
     thread["error"] = merge_errors(error_message, upload_error)
 
     store.log_event(
@@ -1407,6 +1336,7 @@ def handle_chat(
             "type": "chat",
             "ts": now_ts(),
             "thread_id": state["active_id"],
+            "thread_key": thread.get("thread_key", ""),  # Stable immutable key for tracking
             "thread_title": thread.get("title", ""),
             "model": config.get("model", DEFAULT_MODEL),
             "user": message,
@@ -1422,9 +1352,18 @@ def handle_chat(
         }
     )
 
-    persist_thread(state, state["active_id"], touch=True)
+    # Persist thread asynchronously (don't block UI)
+    def _async_persist_chat():
+        try:
+            persist_thread(state, state["active_id"], touch=True)
+        except Exception as e:
+            if KB_ENABLE_TIMING_LOGS:
+                print(f"[CHAT BG] Database persist error: {e}")
+    
+    persist_chat_obj = threading.Thread(target=_async_persist_chat, daemon=True)
+    persist_chat_obj.start()
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = (
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
         get_thread_payload(thread)
     )
     return (
@@ -1437,7 +1376,6 @@ def handle_chat(
         exec_image,
         image_gallery,
         file_html,
-        thinking,
         error,
         "",
         gr.update(value=None),
@@ -1576,14 +1514,18 @@ def approve_code(
 
     if image_path and Path(image_path).exists():
         image_bytes = Path(image_path).read_bytes()
+        # Use thread_key and chart_counter for consistent naming
+        thread["chart_counter"] = thread.get("chart_counter", 0) + 1
+        chart_filename = f"chart{thread['chart_counter']}.png"
         image_asset = store.save_media(
             thread_id=thread.get("thread_id", ""),
-            filename=f"{thread.get('title', 'chat').replace(' ', '_')}_chart.png",
+            thread_key=thread.get("thread_key", ""),
+            filename=chart_filename,
             data=image_bytes,
             content_type="image/png",
             kind="image",
             source="execution",
-            metadata={"caption": thread.get("title", "Chart image")},
+            metadata={"caption": f"Chart {thread['chart_counter']} - {thread.get('title', 'Chart')}"},
             mongo_uri_template=mongo_uri_template,
             mongo_password=mongo_password,
             mongo_db_name=mongo_db_name,
@@ -1603,6 +1545,7 @@ def approve_code(
             "type": "code_execution",
             "ts": now_ts(),
             "thread_id": state["active_id"],
+            "thread_key": thread.get("thread_key", ""),  # Stable immutable key for tracking
             "thread_title": thread.get("title", ""),
             "code": code,
             "output": output,
@@ -1611,7 +1554,17 @@ def approve_code(
         }
     )
 
-    persist_thread(state, state["active_id"], touch=True)
+    # Persist code execution asynchronously (don't block UI)
+    def _async_persist_code():
+        try:
+            persist_thread(state, state["active_id"], touch=True)
+        except Exception as e:
+            if KB_ENABLE_TIMING_LOGS:
+                print(f"[CODE BG] Database persist error: {e}")
+    
+    persist_code_obj = threading.Thread(target=_async_persist_code, daemon=True)
+    persist_code_obj.start()
+    
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
     return (
         state,
@@ -1643,7 +1596,7 @@ def load_app_state() -> Tuple[
 ]:
     state = load_state()
     thread = state["threads"][state["active_id"]]
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, thinking, error, file_download_choices = get_thread_payload(thread)
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
         state,
@@ -1655,7 +1608,6 @@ def load_app_state() -> Tuple[
         exec_image,
         image_gallery,
         file_html,
-        thinking,
         thread["error"],
         "",
         gr.update(value=None),
@@ -1724,7 +1676,16 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
         with gr.Column(scale=1, min_width=280):
             nav = gr.Radio(choices=["Chat", "Model"], value="Chat", label="Navigator")
             thread_list = gr.Dropdown(choices=[], label="Conversations")
-            new_chat_btn = gr.Button("New chat")
+            
+            new_chat_btn = gr.Button("➕ New conversation", scale=1)
+            
+            new_title_input = gr.Textbox(
+                label="Title for new conversation",
+                placeholder="Enter a title or leave empty for auto-generated name...",
+                interactive=True,
+                visible=False,
+                lines=1,
+            )
 
             gr.Markdown("### Chart history")
             image_history = gr.Gallery(
@@ -1766,13 +1727,6 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
                 approve_btn = gr.Button("Approve and run")
                 exec_output = gr.Textbox(label="Execution output", interactive=False)
                 exec_image = gr.Image(label="Latest chart / execution image")
-                thinking_box = gr.Textbox(
-                    label="API Thinking Process",
-                    interactive=False,
-                    lines=6,
-                    elem_classes=["thinking-box"],
-                    max_lines=10,
-                )
                 error_box = gr.Textbox(label="Error", interactive=False, lines=4)
 
             with gr.Group(visible=False) as model_page:
@@ -1790,16 +1744,40 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
         exec_image,
         image_history,
         file_history,
-        thinking_box,
         error_box,
         message,
         upload_ctx,
         file_download_select,
+        # new_title_input,
     ]
     demo.load(fn=load_app_state, outputs=load_outputs)
 
     thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
-    new_chat_btn.click(fn=new_thread, inputs=[state], outputs=load_outputs)
+    
+    # Toggle title input for new chat
+    def toggle_new_title_input(state_val):
+        return gr.update(visible=True, value="")
+    
+    new_chat_btn.click(
+        fn=toggle_new_title_input,
+        inputs=[state],
+        outputs=[new_title_input],
+    )
+    
+    # Create new chat with title on Enter
+    def create_new_chat_with_title(state_val, title_input):
+        result = new_thread(state_val, title_input)
+
+        return (
+            *result[:-1],
+            gr.update(visible=False, value=""),
+        )
+    
+    new_title_input.submit(
+        fn=create_new_chat_with_title,
+        inputs=[state, new_title_input],
+        outputs=load_outputs + [new_title_input],
+    )
 
     chat_inputs = [
         state,

@@ -215,12 +215,12 @@ class FirebaseStore:
             return
         payload = {
             "thread_id": thread_id,
+            "thread_key": thread.get("thread_key", f"thread_{uuid4().hex[:12]}"),
             "title": thread.get("title", "Untitled"),
             "messages": thread.get("messages", []),
             "code": thread.get("code", ""),
             "code_status": thread.get("code_status", ""),
             "exec_output": thread.get("exec_output", ""),
-            "thinking": thread.get("thinking", ""),
             "error": thread.get("error", ""),
             "created_at": thread.get("created_at", ""),
             "updated_at": thread.get("updated_at", ""),
@@ -228,6 +228,7 @@ class FirebaseStore:
             "uploaded_files": thread.get("uploaded_files", []),
             "image_history": thread.get("image_history", []),
             "last_exec_image_asset_id": thread.get("last_exec_image_asset_id", ""),
+            "chart_counter": int(thread.get("chart_counter", 0)),
         }
         try:
             collection.document(thread_id).set(payload)
@@ -281,6 +282,7 @@ class FirebaseStore:
     def _save_media_to_mongo(
         self,
         thread_id: str,
+        thread_key: str,
         filename: str,
         data: bytes,
         content_type: str,
@@ -300,6 +302,7 @@ class FirebaseStore:
         bucket = GridFSBucket(db, bucket_name="chat_media")
         gridfs_metadata = {
             "thread_id": thread_id,
+            "thread_key": thread_key,  # Store stable thread key
             "chat_namespace": self.chat_namespace,
             "kind": kind,
             "source": source,
@@ -339,6 +342,7 @@ class FirebaseStore:
         kind: str,
         source: str,
         metadata: Optional[Dict[str, Any]] = None,
+        thread_key: str = "",
         mongo_uri_template: str = "",
         mongo_password: str = "",
         mongo_db_name: str = "",
@@ -346,6 +350,7 @@ class FirebaseStore:
         try:
             asset = self._save_media_to_mongo(
                 thread_id=thread_id,
+                thread_key=thread_key,
                 filename=filename,
                 data=data,
                 content_type=content_type,
