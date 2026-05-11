@@ -734,6 +734,8 @@ def process_uploaded_files(
                 "size_bytes": len(data),
                 "text_excerpt": trim_text(extracted_text, ATTACHMENT_STORED_TEXT_LIMIT),
                 "storage_backend": "not-persisted",
+                # keep original local path so downloads can fallback to it
+                "metadata": {"local_path": str(path)},
             }
         else:
             file_meta = asset
@@ -919,7 +921,13 @@ def materialize_thread_upload(thread: Dict[str, Any], file_ref: str) -> str:
         raise FileNotFoundError(f"No uploaded file matched '{file_ref}'.")
 
     filename = item.get("name") or f"{item.get('asset_id', uuid4().hex)}.bin"
-    
+    # If asset couldn't be persisted, allow fallback to the original local path
+    backend = normalize_text_block(item.get("storage_backend", "")).lower()
+    meta = item.get("metadata") or {}
+    local_path = meta.get("local_path") if isinstance(meta, dict) else None
+    if backend == "not-persisted" and local_path and Path(local_path).exists():
+        return local_path
+
     data = store.load_media_bytes(
         item,
         mongo_uri_template=DEFAULT_MONGODB_URI_TEMPLATE,
@@ -928,7 +936,7 @@ def materialize_thread_upload(thread: Dict[str, Any], file_ref: str) -> str:
     )
     if data is None:
         raise RuntimeError(format_store_error() or f"Could not load stored bytes for '{filename}'.")
-    
+
     # Create temporary file
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
     temp_file.write(data)
@@ -1063,7 +1071,7 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
             f"<small>{html.escape(size_text)}</small>"
             "</div>"
             "<div class='file-chip-actions'>"
-            f"<button class='file-action-btn download' onclick='triggerFileDownload(this)' type='button' title='Download'>⬇️</button>"
+            f"<button class='file-action-btn download' type='button' title='Download'>⬇️</button>"
             "</div>"
             "</div>"
         )
@@ -1075,7 +1083,12 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown, Any, Any]:
+    # Determine title input visibility (show if no normalized title)
+    title_text = str(thread.get("title", "") or "")
+    title_visible = not bool(normalize_text_block(title_text))
+    files_exist = bool(thread.get("uploaded_files"))
+
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -1085,7 +1098,9 @@ def get_thread_payload(
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        gr.update(choices=build_file_download_choices(thread), value=None),
+        gr.update(choices=build_file_download_choices(thread), value=None, visible=files_exist),
+        gr.update(visible=title_visible, value=title_text),
+        gr.update(visible=files_exist),
     )
 
 
@@ -1110,8 +1125,8 @@ def select_thread(
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
     
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
-    
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices, new_title_update, file_download_btn_update = get_thread_payload(thread)
+
     return (
         state,
         refresh_thread_list(state),
@@ -1126,12 +1141,15 @@ def select_thread(
         "",
         gr.update(value=None),
         file_download_choices,
+        new_title_update,
+        file_download_btn_update,
     )
 
 
 def new_thread(
     state: Dict[str, Any],
     title: str = "",
+    preserve_title: bool = False,
 ) -> Tuple[
     Dict[str, Any],
     gr.Dropdown,
@@ -1149,7 +1167,11 @@ def new_thread(
 ]:
     thread_id = make_thread_id()
     # If title provided, use it. Otherwise leave empty - will be auto-generated from first query
-    final_title = normalize_text_block(title).strip() if title else ""
+    # If preserve_title is True, do not apply trimming/truncation; keep user's input (whitespace trimmed)
+    if title:
+        final_title = str(title).strip() if preserve_title else normalize_text_block(title).strip()
+    else:
+        final_title = ""
     thread = build_thread(title=final_title, order_index=len(state["order"]))
     thread["thread_id"] = thread_id
     state["threads"][thread_id] = thread
@@ -1168,21 +1190,24 @@ def new_thread(
     persist_thread_obj.start()
     
     # Return IMMEDIATELY - UI updates fast, DB saves in background
+    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices, new_title_update, file_download_btn_update = get_thread_payload(thread)
+
     return (
         state,
         refresh_thread_list(state),
-        [],
-        "",
-        "",
-        "",
-        None,
-        [],
-        render_uploaded_files_html(thread),
-        "",
+        messages,
+        code,
+        code_status,
+        exec_output,
+        exec_image,
+        image_gallery,
+        file_html,
+        error,
         "",
         gr.update(value=None),
-        gr.update(choices=build_file_download_choices(thread), value=None),
-        # gr.update(visible=True, value=thread.get("title", "")),
+        file_download_choices,
+        new_title_update,
+        file_download_btn_update,
     )
 
 
@@ -1231,9 +1256,19 @@ def handle_chat(
 
     uploaded_paths = [str(path) for path in (upload_paths or []) if str(path).strip()]
     if not normalize_text_block(message) and not uploaded_paths:
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
-            get_thread_payload(thread)
-        )
+        (
+            messages,
+            code,
+            code_status,
+            exec_output,
+            exec_image,
+            image_gallery,
+            file_html,
+            error,
+            file_download_choices,
+            new_title_update,
+            file_download_btn_update,
+        ) = get_thread_payload(thread)
         return (
             state,
             refresh_thread_list(state),
@@ -1248,6 +1283,8 @@ def handle_chat(
             "",
             gr.update(value=None),
             file_download_choices,
+            new_title_update,
+            file_download_btn_update,
         )
 
     saved_attachments, current_upload_blocks, attachment_parts, upload_error = process_uploaded_files(
@@ -1286,9 +1323,19 @@ def handle_chat(
     if not client:
         thread["error"] = merge_errors("Missing GEMINI_API_KEY", upload_error)
         persist_thread(state, state["active_id"], touch=True)
-        messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
-            get_thread_payload(thread)
-        )
+        (
+            messages,
+            code,
+            code_status,
+            exec_output,
+            exec_image,
+            image_gallery,
+            file_html,
+            error,
+            file_download_choices,
+            new_title_update,
+            file_download_btn_update,
+        ) = get_thread_payload(thread)
         return (
             state,
             refresh_thread_list(state),
@@ -1303,6 +1350,8 @@ def handle_chat(
             "",
             gr.update(value=None),
             file_download_choices,
+            new_title_update,
+            file_download_btn_update,
         )
 
     try:
@@ -1363,9 +1412,19 @@ def handle_chat(
     persist_chat_obj = threading.Thread(target=_async_persist_chat, daemon=True)
     persist_chat_obj.start()
     thread["error"] = merge_errors(thread.get("error", ""), format_store_error())
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = (
-        get_thread_payload(thread)
-    )
+    (
+        messages,
+        code,
+        code_status,
+        exec_output,
+        exec_image,
+        image_gallery,
+        file_html,
+        error,
+        file_download_choices,
+        new_title_update,
+        file_download_btn_update,
+    ) = get_thread_payload(thread)
     return (
         state,
         refresh_thread_list(state),
@@ -1380,6 +1439,8 @@ def handle_chat(
         "",
         gr.update(value=None),
         file_download_choices,
+        new_title_update,
+        file_download_btn_update,
     )
 
 
@@ -1596,7 +1657,19 @@ def load_app_state() -> Tuple[
 ]:
     state = load_state()
     thread = state["threads"][state["active_id"]]
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices = get_thread_payload(thread)
+    (
+        messages,
+        code,
+        code_status,
+        exec_output,
+        exec_image,
+        image_gallery,
+        file_html,
+        error,
+        file_download_choices,
+        new_title_update,
+        file_download_btn_update,
+    ) = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
         state,
@@ -1612,6 +1685,8 @@ def load_app_state() -> Tuple[
         "",
         gr.update(value=None),
         file_download_choices,
+        new_title_update,
+        file_download_btn_update,
     )
 
 
@@ -1748,35 +1823,40 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
         message,
         upload_ctx,
         file_download_select,
-        # new_title_input,
+        new_title_input,
+        file_download_btn,
     ]
     demo.load(fn=load_app_state, outputs=load_outputs)
 
     thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
     
-    # Toggle title input for new chat
-    def toggle_new_title_input(state_val):
-        return gr.update(visible=True, value="")
-    
+    # Create new chat and show title input immediately
+    def new_chat_btn_clicked(state_val):
+        result = new_thread(state_val, "")
+        # result structure: ... , file_download_choices, new_title_update, file_download_btn_update
+        # Force the title input to be visible and empty for the user to edit
+        return (*result[:-2], gr.update(visible=True, value=""), result[-1])
+
     new_chat_btn.click(
-        fn=toggle_new_title_input,
+        fn=new_chat_btn_clicked,
         inputs=[state],
-        outputs=[new_title_input],
+        outputs=load_outputs,
     )
     
     # Create new chat with title on Enter
     def create_new_chat_with_title(state_val, title_input):
-        result = new_thread(state_val, title_input)
+        # preserve_title=True ensures we don't re-trim or alter user's manual title
+        result = new_thread(state_val, title_input, preserve_title=True)
 
-        return (
-            *result[:-1],
-            gr.update(visible=False, value=""),
-        )
+        # result structure: ... , file_download_choices, new_title_update, file_download_btn_update
+        # Hide the input and show the exact entered title (trim only outer whitespace)
+        final_title = str(title_input).strip() if title_input else ""
+        return (*result[:-2], gr.update(visible=False, value=final_title), result[-1])
     
     new_title_input.submit(
         fn=create_new_chat_with_title,
         inputs=[state, new_title_input],
-        outputs=load_outputs + [new_title_input],
+        outputs=load_outputs,
     )
 
     chat_inputs = [
