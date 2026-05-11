@@ -106,6 +106,15 @@ SUBTYPE_FIELDS = [
     "Loại hình văn phòng",
 ]
 
+PROPERTY_TYPE_CHOICES = [
+    "Căn hộ/Chung cư",
+    "Đất",
+    "Nhà ở",
+    "Văn phòng, Mặt bằng kinh doanh",
+]
+BEDROOM_COUNT_CHOICES = ["0", *[str(value) for value in range(1, 11)], "Nhiều hơn 10"]
+BATHROOM_COUNT_CHOICES = [str(value) for value in range(0, 7)] + ["Nhiều hơn 6"]
+
 
 def load_artifact():
     if joblib is None:
@@ -178,6 +187,14 @@ def load_model_bundle():
         return None, error, False
 
 
+def get_cached_bundle():
+    bundle = MODEL_CACHE.get("bundle")
+    error = MODEL_CACHE.get("error", "")
+    if bundle is None or error:
+        return None, error or "Model chưa được tải."
+    return bundle, ""
+
+
 def to_float(value):
     if value in (None, ""):
         return None
@@ -193,7 +210,7 @@ def clean_option_series(series):
     return sorted(values.unique().tolist())
 
 
-def select_options(series, include_blank=True):
+def select_options(series, include_blank=False):
     options = clean_option_series(series)
     return ([""] + options) if include_blank else options
 
@@ -290,7 +307,7 @@ def resolve_legacy_address_candidates(df, new_city, new_ward, street):
     return filtered, candidate_summary
 
 
-def safe_select(value, options, default=""):
+def safe_select(value, options, default=None):
     return value if value in options else default
 
 
@@ -299,15 +316,21 @@ def compute_form_state(raw_address_df, property_type_column, selected_new_city="
     if selected_new_city:
         new_city_df = new_city_df[new_city_df[NEW_CITY_FIELD] == selected_new_city]
 
-    new_ward_options = select_options(new_city_df[NEW_WARD_FIELD])
-    selected_new_ward = safe_select(selected_new_ward, new_ward_options)
+    new_ward_options = []
+    if selected_new_city:
+        new_ward_options = select_options(new_city_df[NEW_WARD_FIELD], include_blank=False)
+        selected_new_ward = safe_select(selected_new_ward, new_ward_options)
+    else:
+        selected_new_ward = None
 
-    new_ward_df = new_city_df.copy()
-    if selected_new_ward:
+    street_options = []
+    if selected_new_city and selected_new_ward:
+        new_ward_df = new_city_df.copy()
         new_ward_df = new_ward_df[new_ward_df[NEW_WARD_FIELD] == selected_new_ward]
-
-    street_options = select_options(new_ward_df[STREET_FIELD])
-    selected_street = safe_select(selected_street, street_options)
+        street_options = select_options(new_ward_df[STREET_FIELD], include_blank=False)
+        selected_street = safe_select(selected_street, street_options)
+    else:
+        selected_street = None
 
     _, legacy_candidates = resolve_legacy_address_candidates(
         raw_address_df,
@@ -317,8 +340,8 @@ def compute_form_state(raw_address_df, property_type_column, selected_new_city="
     )
 
     legacy_old_ward_options = clean_option_series(legacy_candidates[OLD_WARD_FIELD]) if not legacy_candidates.empty else []
-    old_ward_dropdown_options = [""] + legacy_old_ward_options
-    default_old_ward = legacy_old_ward_options[0] if legacy_old_ward_options else ""
+    old_ward_dropdown_options = legacy_old_ward_options
+    default_old_ward = legacy_old_ward_options[0] if legacy_old_ward_options else None
     selected_old_ward = safe_select(selected_old_ward, legacy_old_ward_options, default_old_ward)
 
     resolved_candidates = legacy_candidates.copy()
@@ -348,22 +371,22 @@ def compute_form_state(raw_address_df, property_type_column, selected_new_city="
     if selected_street:
         input_scope_df = input_scope_df[input_scope_df[STREET_FIELD] == selected_street]
 
-    property_type_options = select_options(input_scope_df[property_type_column])
+    property_type_options = PROPERTY_TYPE_CHOICES
     selected_property_type = safe_select(selected_property_type, property_type_options)
 
     type_df = input_scope_df.copy()
     if selected_property_type:
         type_df = type_df[type_df[property_type_column] == selected_property_type]
 
-    bedroom_options = select_options(type_df[BEDROOM_FIELD]) if BEDROOM_FIELD in type_df.columns else [""]
-    bathroom_options = select_options(type_df[BATHROOM_FIELD]) if BATHROOM_FIELD in type_df.columns else [""]
+    bedroom_options = BEDROOM_COUNT_CHOICES
+    bathroom_options = BATHROOM_COUNT_CHOICES
     relevant_subtype_fields = find_relevant_subtype_fields(input_scope_df, selected_property_type)
 
     subtype_updates = []
     for field in SUBTYPE_FIELDS:
         is_visible = field in relevant_subtype_fields
-        choices = select_options(type_df[field]) if is_visible and field in type_df.columns else [""]
-        subtype_updates.append(gr.update(choices=choices, value="", visible=is_visible))
+        choices = select_options(type_df[field], include_blank=False) if is_visible and field in type_df.columns else []
+        subtype_updates.append(gr.update(choices=choices, value=None, visible=is_visible))
 
     return {
         "new_ward_options": new_ward_options,
@@ -406,20 +429,21 @@ def build_property_model_page():
     gr.Markdown(
         "Nhập địa chỉ mới từ dataset gốc. Ứng dụng sẽ tự map sang địa chỉ cũ tương ứng để đưa vào model dự đoán."
     )
-    model_bundle = gr.State(None)
-    load_status = gr.Markdown("Model chưa được tải. Bấm **Load model** để bắt đầu.")
-    load_button = gr.Button("Load model")
+    model_ready = gr.State(False)
+    load_status = gr.Markdown("Model chưa được tải. Bấm **Tải model** để bắt đầu.")
+    load_button = gr.Button("Tải model")
 
-    with gr.Group(visible=False) as form_group:
+    with gr.Group(visible=True) as form_group:
+        load_city_button = gr.Button("Tải danh sách tỉnh/thành phố", interactive=False)
         with gr.Row():
-            new_city = gr.Dropdown(label="Tỉnh/Thành phố mới", choices=[""], value="")
-            new_ward = gr.Dropdown(label="Phường/Xã mới", choices=[""], value="")
-            street = gr.Dropdown(label="Đường", choices=[""], value="")
+            new_city = gr.Dropdown(label="Tỉnh/Thành phố mới", choices=[], value=None)
+            new_ward = gr.Dropdown(label="Phường/Xã mới", choices=[], value=None)
+            street = gr.Dropdown(label="Đường", choices=[], value=None)
 
         old_ward_choice = gr.Dropdown(
             label="Phường/Xã cũ",
-            choices=[""],
-            value="",
+            choices=[],
+            value=None,
             visible=False,
             info="Nếu có nhiều khả năng khớp, bạn có thể chọn lại phường/xã cũ.",
         )
@@ -430,17 +454,17 @@ def build_property_model_page():
             resolved_old_district = gr.Textbox(label="Huyện/Quận cũ", value="", interactive=False)
             resolved_old_city = gr.Textbox(label="Tỉnh/Thành phố cũ", value="", interactive=False)
 
-        property_type = gr.Dropdown(label="Loại hình", choices=[""], value="")
+        property_type = gr.Dropdown(label="Loại hình", choices=PROPERTY_TYPE_CHOICES, value=None)
 
         with gr.Row():
             area = gr.Number(label="Diện tích", value=None, minimum=0)
-            bedrooms = gr.Dropdown(label=BEDROOM_FIELD, choices=[""], value="")
-            bathrooms = gr.Dropdown(label=BATHROOM_FIELD, choices=[""], value="")
+            bedrooms = gr.Dropdown(label=BEDROOM_FIELD, choices=BEDROOM_COUNT_CHOICES, value=None)
+            bathrooms = gr.Dropdown(label=BATHROOM_FIELD, choices=BATHROOM_COUNT_CHOICES, value=None)
 
-        subtype_house = gr.Dropdown(label="Loại hình nhà ở", choices=[""], value="", visible=False)
-        subtype_apartment = gr.Dropdown(label="Loại hình căn hộ", choices=[""], value="", visible=False)
-        subtype_land = gr.Dropdown(label="Loại hình đất", choices=[""], value="", visible=False)
-        subtype_office = gr.Dropdown(label="Loại hình văn phòng", choices=[""], value="", visible=False)
+        subtype_house = gr.Dropdown(label="Loại hình nhà ở", choices=[], value=None, visible=False)
+        subtype_apartment = gr.Dropdown(label="Loại hình căn hộ", choices=[], value=None, visible=False)
+        subtype_land = gr.Dropdown(label="Loại hình đất", choices=[], value=None, visible=False)
+        subtype_office = gr.Dropdown(label="Loại hình văn phòng", choices=[], value=None, visible=False)
 
         predict_button = gr.Button("Dự đoán", variant="primary")
         prediction_output = gr.Markdown()
@@ -448,60 +472,45 @@ def build_property_model_page():
         summary_table = gr.Dataframe(value=pd.DataFrame(), interactive=False, wrap=True, visible=False)
 
     def handle_load_model():
+        yield (
+            "Đang tải model...",
+            False,
+            gr.update(interactive=False),
+        )
         bundle, status, ok = load_model_bundle()
         if not ok or bundle is None:
-            return (
+            yield (
                 f"## Không thể tải model\n```text\n{status}\n```",
-                None,
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                gr.update(choices=[], value=""),
-                gr.update(choices=[], value=""),
-                gr.update(choices=[], value=""),
-                gr.update(choices=[], value="", visible=False),
-                "",
-                "",
-                "",
-                gr.update(choices=[], value=""),
-                gr.update(choices=[""], value=""),
-                gr.update(choices=[""], value=""),
-                gr.update(choices=[""], value="", visible=False),
-                gr.update(choices=[""], value="", visible=False),
-                gr.update(choices=[""], value="", visible=False),
-                gr.update(choices=[""], value="", visible=False),
+                False,
+                gr.update(interactive=False),
             )
-
-        state = compute_form_state(bundle["raw_address_df"], bundle["property_type_column"])
-        summary_df = bundle["summary_df"]
-        return (
+            return
+        yield (
             status,
-            bundle,
-            gr.update(visible=True),
-            gr.update(visible=not summary_df.empty),
-            gr.update(value=summary_df, visible=not summary_df.empty),
-            gr.update(choices=select_options(bundle["raw_address_df"][NEW_CITY_FIELD]), value=""),
-            gr.update(choices=state["new_ward_options"], value=state["selected_new_ward"]),
-            gr.update(choices=state["street_options"], value=state["selected_street"]),
-            gr.update(choices=state["old_ward_options"], value=state["selected_old_ward"], visible=state["old_ward_visible"]),
-            state["resolved_old_ward"],
-            state["resolved_old_district"],
-            state["resolved_old_city"],
-            gr.update(choices=state["property_type_options"], value=state["selected_property_type"]),
-            gr.update(choices=state["bedroom_options"], value=""),
-            gr.update(choices=state["bathroom_options"], value=""),
-            *state["subtype_updates"],
+            True,
+            gr.update(interactive=True),
         )
 
+    def populate_new_city_options(model_ready):
+        if not model_ready:
+            return gr.update()
+        bundle, _ = get_cached_bundle()
+        if bundle is None:
+            return gr.update()
+        return gr.update(choices=select_options(bundle["raw_address_df"][NEW_CITY_FIELD], include_blank=False), value=None)
+
     def refresh_form(
-        bundle,
+        model_ready,
         selected_new_city,
         selected_new_ward,
         selected_street,
         selected_old_ward,
         selected_property_type,
     ):
-        if not bundle:
+        if not model_ready:
+            return [gr.update() for _ in range(13)]
+        bundle, _ = get_cached_bundle()
+        if bundle is None:
             return [gr.update() for _ in range(13)]
         state = compute_form_state(
             bundle["raw_address_df"],
@@ -521,13 +530,13 @@ def build_property_model_page():
             state["resolved_old_district"],
             state["resolved_old_city"],
             gr.update(choices=state["property_type_options"], value=state["selected_property_type"]),
-            gr.update(choices=state["bedroom_options"], value=""),
-            gr.update(choices=state["bathroom_options"], value=""),
+            gr.update(choices=state["bedroom_options"], value=None),
+            gr.update(choices=state["bathroom_options"], value=None),
             *state["subtype_updates"],
         ]
 
     def build_prediction_output(
-        bundle,
+        model_ready,
         selected_new_city,
         selected_new_ward,
         selected_street,
@@ -541,7 +550,11 @@ def build_property_model_page():
         subtype_land,
         subtype_office,
     ):
-        if not bundle:
+        if not model_ready:
+            return "Hãy bấm Load model trước khi dự đoán."
+
+        bundle, _ = get_cached_bundle()
+        if bundle is None:
             return "Hãy bấm Load model trước khi dự đoán."
 
         state = compute_form_state(
@@ -608,28 +621,18 @@ def build_property_model_page():
         handle_load_model,
         outputs=[
             load_status,
-            model_bundle,
-            form_group,
-            summary_title,
-            summary_table,
-            new_city,
-            new_ward,
-            street,
-            old_ward_choice,
-            resolved_old_ward,
-            resolved_old_district,
-            resolved_old_city,
-            property_type,
-            bedrooms,
-            bathrooms,
-            subtype_house,
-            subtype_apartment,
-            subtype_land,
-            subtype_office,
+            model_ready,
+            load_city_button,
         ],
     )
 
-    refresh_inputs = [model_bundle, new_city, new_ward, street, old_ward_choice, property_type]
+    load_city_button.click(
+        populate_new_city_options,
+        inputs=[model_ready],
+        outputs=[new_city],
+    )
+
+    refresh_inputs = [model_ready, new_city, new_ward, street, old_ward_choice, property_type]
     refresh_outputs = [
         new_ward,
         street,
@@ -652,7 +655,7 @@ def build_property_model_page():
     predict_button.click(
         build_prediction_output,
         inputs=[
-            model_bundle,
+            model_ready,
             new_city,
             new_ward,
             street,

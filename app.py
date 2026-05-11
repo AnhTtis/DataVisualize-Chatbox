@@ -1594,10 +1594,6 @@ def approve_code(
     )
 
 
-def set_page(page: str) -> Tuple[Any, Any]:
-    return gr.update(visible=(page == "Chat")), gr.update(visible=(page == "Model"))
-
-
 def load_app_state() -> Tuple[
     Dict[str, Any],
     gr.Dropdown,
@@ -1685,50 +1681,52 @@ def debug_check_mongo() -> None:
     except Exception as exc:  # pragma: no cover - debug helper
         print(f"[DEBUG] MongoDB check error: {exc}")
 
+def build_chat_blocks() -> gr.Blocks:
+    with gr.Blocks(title="Data Visualize Chatbox - Chat") as chat_demo:
+        state = gr.State(init_state())
+        config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
 
-with gr.Blocks(title="Data Visualize Chatbox") as demo:
-    state = gr.State(init_state())
-    config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
+        with gr.Row():
+            with gr.Column(scale=1, min_width=280):
+                thread_list = gr.Dropdown(choices=[], label="Conversations")
+                new_chat_btn = gr.Button("New chat")
 
-    with gr.Row():
-        with gr.Column(scale=1, min_width=280):
-            nav = gr.Radio(choices=["Chat", "Model"], value="Chat", label="Navigator")
-            thread_list = gr.Dropdown(choices=[], label="Conversations")
-            new_chat_btn = gr.Button("New chat")
+                gr.Markdown("### Chart history")
+                image_history = gr.Gallery(
+                    label="Generated images",
+                    columns=2,
+                    height=250,
+                    object_fit="contain",
+                    elem_classes=["image-history-grid"],
+                )
 
-            gr.Markdown("### Chart history")
-            image_history = gr.Gallery(
-                label="Generated images",
-                columns=2,
-                height=250,
-                object_fit="contain",
-                elem_classes=["image-history-grid"],
-            )
+                gr.Markdown("### Uploaded files")
+                file_history = gr.HTML(render_uploaded_files_html(build_thread("Chat 1", 0)))
 
-            gr.Markdown("### Uploaded files")
-            file_history = gr.HTML(render_uploaded_files_html(build_thread("Chat 1", 0)))
-            
-            file_download_trigger = gr.Textbox(visible=False, interactive=False)
-            file_download_select = gr.Dropdown(
-                label="Select file to download",
-                choices=[],
-                interactive=True,
-                visible=False,
-            )
-            file_download_btn = gr.Button("📥 Download", visible=False, scale=1)
-            
-            file_download_output = gr.File(label="Downloaded file", interactive=False)
+                file_download_trigger = gr.Textbox(visible=False, interactive=False)
+                file_download_select = gr.Dropdown(
+                    label="Select file to download",
+                    choices=[],
+                    interactive=True,
+                    visible=False,
+                )
+                file_download_btn = gr.Button("📥 Download", visible=False, scale=1)
 
-            mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
-            mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
-            mongo_db_name = gr.Textbox(value=DEFAULT_MONGODB_DB_NAME, visible=False)
-            mongo_collection_name = gr.Textbox(value=DEFAULT_MONGODB_COLLECTION_NAME, visible=False)
+                file_download_output = gr.File(label="Downloaded file", interactive=False)
 
-        with gr.Column(scale=4):
-            with gr.Group(visible=True) as chat_page:
+                mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
+                mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
+                mongo_db_name = gr.Textbox(value=DEFAULT_MONGODB_DB_NAME, visible=False)
+                mongo_collection_name = gr.Textbox(value=DEFAULT_MONGODB_COLLECTION_NAME, visible=False)
+
+            with gr.Column(scale=4):
                 chatbot = gr.Chatbot(label="Chat")
                 with gr.Row():
-                    message = gr.Textbox(label="Message", scale=4, placeholder="Đặt câu hỏi về dữ liệu, file đã upload hoặc yêu cầu vẽ biểu đồ...")
+                    message = gr.Textbox(
+                        label="Message",
+                        scale=4,
+                        placeholder="Đặt câu hỏi về dữ liệu, file đã upload hoặc yêu cầu vẽ biểu đồ...",
+                    )
                     send_btn = gr.Button("Send", scale=1)
                 upload_ctx = gr.File(label="Attach files", file_count="multiple", type="filepath")
                 code_box = gr.Code(label="Generated code", language="python")
@@ -1738,61 +1736,64 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
                 exec_image = gr.Image(label="Latest chart / execution image")
                 error_box = gr.Textbox(label="Error", interactive=False, lines=4)
 
-            with gr.Group(visible=False) as model_page:
-                build_property_model_page()
+        load_outputs = [
+            state,
+            thread_list,
+            chatbot,
+            code_box,
+            code_status,
+            exec_output,
+            exec_image,
+            image_history,
+            file_history,
+            error_box,
+            message,
+            upload_ctx,
+            file_download_select,
+        ]
+        chat_demo.load(fn=load_app_state, outputs=load_outputs)
 
-    nav.change(fn=set_page, inputs=[nav], outputs=[chat_page, model_page])
+        thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
+        new_chat_btn.click(fn=new_thread, inputs=[state], outputs=load_outputs)
 
-    load_outputs = [
-        state,
-        thread_list,
-        chatbot,
-        code_box,
-        code_status,
-        exec_output,
-        exec_image,
-        image_history,
-        file_history,
-        error_box,
-        message,
-        upload_ctx,
-        file_download_select,
-    ]
-    demo.load(fn=load_app_state, outputs=load_outputs)
+        chat_inputs = [
+            state,
+            config_state,
+            message,
+            upload_ctx,
+            mongo_uri_template,
+            mongo_password,
+            mongo_db_name,
+            mongo_collection_name,
+        ]
+        send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
+        message.submit(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
 
-    thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
-    new_chat_btn.click(fn=new_thread, inputs=[state], outputs=load_outputs)
+        file_download_btn.click(
+            fn=download_file,
+            inputs=[state, file_download_select],
+            outputs=file_download_output,
+        )
 
-    chat_inputs = [
-        state,
-        config_state,
-        message,
-        upload_ctx,
-        mongo_uri_template,
-        mongo_password,
-        mongo_db_name,
-        mongo_collection_name,
-    ]
-    send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
-    message.submit(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
+        approve_btn.click(
+            fn=approve_code,
+            inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name],
+            outputs=[state, exec_output, exec_image, code_status, image_history, error_box],
+        )
 
-    file_download_btn.click(
-        fn=download_file,
-        inputs=[state, file_download_select],
-        outputs=file_download_output,
-    )
+        file_download_trigger.change(
+            fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None,
+            inputs=[file_download_trigger, state],
+            outputs=file_download_output,
+        )
 
-    approve_btn.click(
-        fn=approve_code,
-        inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name],
-        outputs=[state, exec_output, exec_image, code_status, image_history, error_box],
-    )
+    return chat_demo
 
-    file_download_trigger.change(
-        fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None,
-        inputs=[file_download_trigger, state],
-        outputs=file_download_output,
-    )
+
+def build_model_blocks() -> gr.Blocks:
+    with gr.Blocks(title="Data Visualize Chatbox - Model") as model_demo:
+        build_property_model_page()
+    return model_demo
 
 
 if __name__ == "__main__":
@@ -1808,4 +1809,7 @@ if __name__ == "__main__":
         if KB_ENABLE_TIMING_LOGS:
             print(f"[KB INIT] preload/connect error: {exc}")
     debug_check_mongo()
+    chat_demo = build_chat_blocks()
+    model_demo = build_model_blocks()
+    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbox")
     demo.launch(css=APP_CSS)
