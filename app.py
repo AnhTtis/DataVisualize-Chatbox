@@ -1284,6 +1284,7 @@ def handle_chat(
     state: Dict[str, Any],
     config: Dict[str, Any],
     message: str,
+    title_input: str,
     upload_paths: Optional[List[str]],
     mongo_uri_template: str,
     mongo_password: str,
@@ -1346,6 +1347,10 @@ def handle_chat(
     )
     if saved_attachments:
         thread["uploaded_files"].extend(saved_attachments)
+
+    raw_title_input = str(title_input or "")
+    if (not normalize_text_block(thread.get("title", ""))) and raw_title_input.strip():
+        thread["title"] = raw_title_input
 
     # Auto-generate title only from the first non-empty message.
     # If the user only uploads files (empty message), keep title blank so the UI can prompt for a title.
@@ -1880,22 +1885,50 @@ def build_chat_blocks() -> gr.Blocks:
         new_chat_btn.click(fn=new_chat_btn_clicked, inputs=[state], outputs=load_outputs)
 
         def create_new_chat_with_title(state_val, title_input):
-            result = new_thread(state_val, title_input, preserve_title=True)
             raw = str(title_input or "")
             final_title = raw if raw.strip() else ""
-            # Ensure the thread title is set exactly as entered and persist it
+            # Set title on the current thread instead of creating a new one.
             try:
                 active_id = state_val.get("active_id")
                 if active_id and state_val.get("threads") and active_id in state_val["threads"]:
                     state_val["threads"][active_id]["title"] = final_title
-                    # persist synchronously to ensure DB reflects the change
                     try:
                         persist_thread(state_val, active_id)
                     except Exception:
                         pass
             except Exception:
                 pass
-            return (*result[:-2], gr.update(visible=False, value=final_title), result[-1])
+            thread = state_val["threads"].get(state_val.get("active_id")) if state_val else None
+            if not thread:
+                return load_app_state(state_val)
+            (
+                messages,
+                code,
+                code_status,
+                exec_output,
+                exec_image,
+                image_gallery,
+                file_html,
+                error,
+                file_download_trigger_update,
+                new_title_update,
+            ) = get_thread_payload(thread)
+            return (
+                state_val,
+                refresh_thread_list(state_val),
+                messages,
+                code,
+                code_status,
+                exec_output,
+                exec_image,
+                image_gallery,
+                file_html,
+                error,
+                "",
+                gr.update(value=None),
+                gr.update(visible=False, value=final_title),
+                file_download_trigger_update,
+            )
 
         new_title_input.submit(fn=create_new_chat_with_title, inputs=[state, new_title_input], outputs=load_outputs)
 
@@ -1903,6 +1936,7 @@ def build_chat_blocks() -> gr.Blocks:
             state,
             config_state,
             message,
+            new_title_input,
             upload_ctx,
             mongo_uri_template,
             mongo_password,
