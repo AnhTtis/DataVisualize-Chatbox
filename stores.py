@@ -341,7 +341,12 @@ class FirebaseStore:
             "created_at": gridfs_metadata["created_at"],
         }
         if metadata:
+            # Keep a nested metadata payload for consistent shape across persisted vs non-persisted assets.
+            # Also preserve the existing behavior where selected metadata keys are flattened for easy access.
+            asset["metadata"] = dict(metadata)
             asset.update(metadata)
+        else:
+            asset["metadata"] = {}
         return asset
 
     def save_media(
@@ -389,9 +394,37 @@ class FirebaseStore:
         mongo_db_name: str = "",
     ) -> Optional[bytes]:
         backend = normalize_text_block(asset.get("storage_backend", "")).lower()
+        gridfs_file_id = normalize_text_block(asset.get("gridfs_file_id", ""))
+        metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
+        local_path = normalize_text_block(metadata.get("local_path", "")) if isinstance(metadata, dict) else ""
+
+        # Backward compatibility:
+        # - Older documents may omit `storage_backend` but still have `gridfs_file_id`.
+        # - Some code may store `storage_backend` as "mongo"/"gridfs".
+        # - "not-persisted" assets may still be readable from a local cached path.
+        if backend in {"not-persisted", "local"}:
+            if local_path and Path(local_path).exists():
+                try:
+                    data = Path(local_path).read_bytes()
+                    self.last_error = ""
+                    return data
+                except Exception:
+                    # fall through to GridFS attempt if available
+                    pass
+            # If local path is missing, but we have a GridFS id, attempt Mongo read.
+            if gridfs_file_id:
+                backend = "mongodb"
+
+        if (not backend and gridfs_file_id) or backend in {"mongodb", "mongo", "gridfs"}:
+            backend = "mongodb"
+
+        # Final safety net: if we have a GridFS id, treat it as Mongo-backed even if
+        # `storage_backend` is an unexpected legacy value.
+        if gridfs_file_id and backend != "mongodb":
+            backend = "mongodb"
+
         try:
             if backend == "mongodb":
-                gridfs_file_id = normalize_text_block(asset.get("gridfs_file_id", ""))
                 if not gridfs_file_id:
                     raise RuntimeError("Missing GridFS file id.")
 

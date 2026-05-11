@@ -206,6 +206,14 @@ def trim_text(text: str, limit: int) -> str:
     return f"{text[:limit].rstrip()}... [truncated {hidden} chars]"
 
 
+def trim_title_text(text: str, limit: int) -> str:
+    """Truncate a user-visible title without adding diagnostic suffixes."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
+
+
 def merge_errors(*messages: str) -> str:
     seen: set[str] = set()
     ordered: List[str] = []
@@ -814,10 +822,14 @@ def normalize_thread(raw_thread: Dict[str, Any], fallback_order_index: int) -> D
     if not thread_key:
         thread_key = f"thread_{uuid4().hex[:12]}"
 
+    # Preserve explicit title as-is; if missing/blank, keep it blank so UI can prompt for a title.
+    raw_title = str(raw_thread.get("title") or "")
+    title = raw_title
+
     return {
         "thread_id": str(raw_thread.get("thread_id") or ""),
         "thread_key": thread_key,
-        "title": str(raw_thread.get("title") or f"Chat {fallback_order_index + 1}"),
+        "title": title,
         "messages": messages,
         "code": str(raw_thread.get("code", "")),
         "code_status": str(raw_thread.get("code_status", "")),
@@ -890,9 +902,25 @@ def list_threads(state: Dict[str, Any]) -> List[Tuple[str, str]]:
         thread = state["threads"].get(thread_id)
         if not thread:
             continue
-        # If title is empty, show a default Chat N label to user
+        # If user provided a title, show it as-is. Otherwise try to
+        # generate a short label from the first non-empty message,
+        # trimming to a reasonable length. If none, fall back to
+        # a default "Chat N" label.
         raw_title = str(thread.get("title") or "")
-        label = raw_title if raw_title.strip() else f"Chat {idx + 1}"
+        if raw_title.strip():
+            label = raw_title
+        else:
+            # find first non-empty message content
+            first_msg = ""
+            for m in thread.get("messages", []):
+                try:
+                    content = str(m.get("content", "") or "").strip()
+                except Exception:
+                    content = ""
+                if content:
+                    first_msg = content
+                    break
+            label = trim_title_text(first_msg, 48) if first_msg else f"Chat {idx + 1}"
         choices.append((label, thread_id))
     return choices
 
@@ -910,7 +938,9 @@ def resolve_thread_upload(thread: Dict[str, Any], file_ref: str) -> Optional[Dic
     if not ref:
         return None
     for item in thread.get("uploaded_files", []):
-        if ref in {item.get("asset_id", ""), item.get("name", ""), item.get("original_name", "")}:
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        original_name = item.get("original_name", "") or (meta.get("original_name") if isinstance(meta, dict) else "")
+        if ref in {item.get("asset_id", ""), item.get("name", ""), original_name}:
             return item
     return None
 
@@ -1074,13 +1104,7 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
         chip.append(f"<strong>{html.escape(name)}</strong>")
         chip.append(f"<small>{html.escape(size_text)}</small>")
         chip.append("</div>")
-        # Inline download icon: sets hidden trigger textbox `file_download_trigger` so backend handles materialization
-        chip.append("<div class='file-chip-actions'>")
-        chip.append(
-            "<button class='file-action-btn download' type='button' title='Download' "
-            "onclick=\"(function(btn){var chip=btn.closest('.file-chip');var ref=chip && chip.dataset && chip.dataset.fileRef;var t=document.getElementById('file_download_trigger'); if(t && ref){t.value=ref; t.dispatchEvent(new Event('input',{bubbles:true}));}})(this)\">⬇️</button>"
-        )
-        chip.append("</div>")
+        # Download disabled: keep uploaded file list read-only to avoid GridFS download errors.
         chip.append("</div>")
         cards.append("".join(chip))
 
@@ -1091,7 +1115,7 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
 
 def get_thread_payload(
     thread: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown, Any, Any]:
+) -> Tuple[List[Dict[str, str]], str, str, str, Optional[Any], List[Tuple[Any, str]], str, str, gr.Dropdown, Any]:
     # Determine title input visibility (show if no normalized title)
     title_text = str(thread.get("title", "") or "")
     title_visible = not bool(normalize_text_block(title_text))
@@ -1108,7 +1132,6 @@ def get_thread_payload(
         thread.get("error", ""),
         gr.update(value=None),  # file_download_trigger (cleared)
         gr.update(visible=title_visible, value=title_text),  # new_title_input
-        gr.update(value=None),  # file_download_output (no file yet)
     )
 
 
@@ -1144,7 +1167,6 @@ def select_thread(
         error,
         file_download_trigger_update,
         new_title_update,
-        file_download_output_update,
     ) = get_thread_payload(thread)
 
     return (
@@ -1162,7 +1184,6 @@ def select_thread(
         gr.update(value=None),
         new_title_update,
         file_download_trigger_update,
-        file_download_output_update,
     )
 
 
@@ -1222,7 +1243,6 @@ def new_thread(
         error,
         file_download_trigger_update,
         new_title_update,
-        file_download_output_update,
     ) = get_thread_payload(thread)
 
     return (
@@ -1240,7 +1260,6 @@ def new_thread(
         gr.update(value=None),
         new_title_update,
         file_download_trigger_update,
-        file_download_output_update,
     )
 
 
@@ -1300,7 +1319,6 @@ def handle_chat(
             error,
             file_download_trigger_update,
             new_title_update,
-            file_download_output_update,
         ) = get_thread_payload(thread)
         return (
             state,
@@ -1317,7 +1335,6 @@ def handle_chat(
             gr.update(value=None),
             new_title_update,
             file_download_trigger_update,
-            file_download_output_update,
         )
 
     saved_attachments, current_upload_blocks, attachment_parts, upload_error = process_uploaded_files(
@@ -1330,11 +1347,10 @@ def handle_chat(
     if saved_attachments:
         thread["uploaded_files"].extend(saved_attachments)
 
-    # Auto-generate title from first query if not already set
-    if not normalize_text_block(thread.get("title", "")):
-        # Trim first query to create title
-        auto_title = trim_text(message.strip(), 48) if message.strip() else f"Chat {len(state['order'])}"
-        thread["title"] = auto_title
+    # Auto-generate title only from the first non-empty message.
+    # If the user only uploads files (empty message), keep title blank so the UI can prompt for a title.
+    if (not normalize_text_block(thread.get("title", ""))) and normalize_text_block(message):
+        thread["title"] = trim_title_text(message.strip(), 48)
 
     thread_upload_context = build_thread_upload_context(
         thread,
@@ -1367,7 +1383,6 @@ def handle_chat(
             error,
             file_download_trigger_update,
             new_title_update,
-            file_download_output_update,
         ) = get_thread_payload(thread)
         return (
             state,
@@ -1384,7 +1399,6 @@ def handle_chat(
             gr.update(value=None),
             new_title_update,
             file_download_trigger_update,
-            file_download_output_update,
         )
 
     try:
@@ -1456,7 +1470,6 @@ def handle_chat(
         error,
         file_download_trigger_update,
         new_title_update,
-        file_download_visible,
     ) = get_thread_payload(thread)
     return (
         state,
@@ -1471,9 +1484,8 @@ def handle_chat(
         error,
         "",
         gr.update(value=None),
-           new_title_update,
-           file_download_trigger_update,
-           gr.update(visible=file_download_visible),
+        new_title_update,
+        file_download_trigger_update,
     )
 
 
@@ -1670,7 +1682,9 @@ def approve_code(
     )
 
 
-def load_app_state() -> Tuple[
+def load_app_state(
+    state_val: Optional[Dict[str, Any]] = None,
+) -> Tuple[
     Dict[str, Any],
     gr.Dropdown,
     List[Dict[str, str]],
@@ -1684,7 +1698,20 @@ def load_app_state() -> Tuple[
     str,
     Any,
 ]:
+    # If storage is temporarily unavailable, do not reset the in-session chat state.
+    # This avoids "creating" a new Chat 1 on reloads when Firestore/Mongo is misconfigured.
     state = load_state()
+    if store.last_error and state_val and isinstance(state_val, dict) and state_val.get("threads"):
+        state = state_val
+        try:
+            active_id = state.get("active_id")
+            if active_id and active_id in state.get("threads", {}):
+                state["threads"][active_id]["error"] = merge_errors(
+                    state["threads"][active_id].get("error", ""),
+                    format_store_error(),
+                )
+        except Exception:
+            pass
     thread = state["threads"][state["active_id"]]
     (
         messages,
@@ -1697,7 +1724,6 @@ def load_app_state() -> Tuple[
         error,
         file_download_trigger_update,
         new_title_update,
-        file_download_output_update,
     ) = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
@@ -1715,7 +1741,6 @@ def load_app_state() -> Tuple[
         gr.update(value=None),
         new_title_update,
         file_download_trigger_update,
-        file_download_output_update,
     )
 
 
@@ -1802,9 +1827,8 @@ def build_chat_blocks() -> gr.Blocks:
                 gr.Markdown("### Uploaded files")
                 file_history = gr.HTML(render_uploaded_files_html(build_thread("", 0)))
 
-                # Hidden trigger textbox used by inline icon clicks (elem_id ensures predictable DOM id)
+                # Hidden trigger textbox (download disabled; kept hidden for backward compatibility)
                 file_download_trigger = gr.Textbox(visible=False, interactive=True, elem_id="file_download_trigger")
-                file_download_output = gr.File(label="Downloaded file", interactive=False)
 
                 mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
                 mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
@@ -1840,7 +1864,6 @@ def build_chat_blocks() -> gr.Blocks:
             upload_ctx,
             new_title_input,
             file_download_trigger,
-            file_download_output,
         ]
         # initial load will be wired when the Blocks is mounted
 
@@ -1893,9 +1916,10 @@ def build_chat_blocks() -> gr.Blocks:
 
         approve_btn.click(fn=approve_code, inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name], outputs=[state, exec_output, exec_image, code_status, image_history, error_box])
 
-        file_download_trigger.change(fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None, inputs=[file_download_trigger, state], outputs=file_download_output)
+        # Download disabled: do not materialize GridFS files from UI.
+        # file_download_trigger.change(fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None, inputs=[file_download_trigger, state], outputs=file_download_output)
         # Load initial app state into the chat block when it mounts
-        chat_demo.load(fn=load_app_state, outputs=load_outputs)
+        chat_demo.load(fn=load_app_state, inputs=[state], outputs=load_outputs)
 
     return chat_demo
 
