@@ -721,11 +721,12 @@ def process_uploaded_files(
             error_message = merge_errors(
                 error_message,
                 format_store_error(),
-                "The file was usable for the current response, but it could not be persisted to MongoDB or local cache.",
+                "The file was usable for the current response, but it could not be persisted to MongoDB.",
             )
             file_meta = {
                 "asset_id": uuid4().hex,
                 "name": path.name,
+                "original_name": path.name,
                 "content_type": mime_type,
                 "size_bytes": len(data),
                 "text_excerpt": trim_text(extracted_text, ATTACHMENT_STORED_TEXT_LIMIT),
@@ -733,6 +734,7 @@ def process_uploaded_files(
                 # keep original local path so downloads can fallback to it
                 "metadata": {"local_path": str(path)},
             }
+            saved_attachments.append(file_meta)
         else:
             file_meta = asset
             saved_attachments.append(file_meta)
@@ -889,8 +891,8 @@ def list_threads(state: Dict[str, Any]) -> List[Tuple[str, str]]:
         if not thread:
             continue
         # If title is empty, show a default Chat N label to user
-        raw_title = str(thread.get('title') or "").strip()
-        label = raw_title if raw_title else f"Chat {idx + 1}"
+        raw_title = str(thread.get("title") or "")
+        label = raw_title if raw_title.strip() else f"Chat {idx + 1}"
         choices.append((label, thread_id))
     return choices
 
@@ -1185,9 +1187,10 @@ def new_thread(
 ]:
     thread_id = make_thread_id()
     # If title provided, use it. Otherwise leave empty - will be auto-generated from first query
-    # If preserve_title is True, do not apply trimming/truncation; keep user's input (whitespace trimmed)
-    if title:
-        final_title = str(title).strip() if preserve_title else normalize_text_block(title).strip()
+    # If preserve_title is True, keep user's input exactly as entered.
+    raw_title = str(title or "")
+    if raw_title.strip():
+        final_title = raw_title if preserve_title else normalize_text_block(raw_title).strip()
     else:
         final_title = ""
     thread = build_thread(title=final_title, order_index=len(state["order"]))
@@ -1628,7 +1631,7 @@ def approve_code(
             thread["error"] = merge_errors(
                 thread.get("error", ""),
                 format_store_error(),
-                "The chart was generated locally, but it could not be persisted to MongoDB or local cache.",
+                "The chart was generated locally, but it could not be persisted to MongoDB.",
             )
 
     store.log_event(
@@ -1855,7 +1858,8 @@ def build_chat_blocks() -> gr.Blocks:
 
         def create_new_chat_with_title(state_val, title_input):
             result = new_thread(state_val, title_input, preserve_title=True)
-            final_title = str(title_input).strip() if title_input else ""
+            raw = str(title_input or "")
+            final_title = raw if raw.strip() else ""
             # Ensure the thread title is set exactly as entered and persist it
             try:
                 active_id = state_val.get("active_id")
