@@ -7,7 +7,7 @@ import re
 import sys
 import tempfile
 import threading
-import traceback
+# traceback not needed at top-level
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -28,11 +28,8 @@ from stores import (
     KB_ENABLE_TIMING_LOGS,
     KB_INCLUDE_ALL_DOCS_IN_PROMPT,
     MongoKnowledgeBase,
-    SEARCH_TOKEN_PATTERN,
     build_mongodb_uri,
     normalize_text_block,
-    tokenize_search_text,
-    log_kb_timing,
 )
 
 load_dotenv()
@@ -348,7 +345,6 @@ def build_instruction_catalog() -> Dict[str, Dict[str, str]]:
         if text:
             catalog[key] = {"path": str(path), "content": text}
     return catalog
-
 
 INSTRUCTION_CATALOG = build_instruction_catalog()
 
@@ -838,7 +834,8 @@ def normalize_thread(raw_thread: Dict[str, Any], fallback_order_index: int) -> D
 
 def init_state() -> Dict[str, Any]:
     thread_id = make_thread_id()
-    thread = build_thread("Chat 1", 0)
+    # Start with an empty title so the UI shows the title input on first run
+    thread = build_thread("", 0)
     thread["thread_id"] = thread_id
     return {"threads": {thread_id: thread}, "order": [thread_id], "active_id": thread_id}
 
@@ -887,12 +884,13 @@ def short_thread_id(thread_id: str) -> str:
 def list_threads(state: Dict[str, Any]) -> List[Tuple[str, str]]:
     """List threads with only title displayed, no internal keys shown to user."""
     choices: List[Tuple[str, str]] = []
-    for thread_id in state["order"]:
+    for idx, thread_id in enumerate(state["order"]):
         thread = state["threads"].get(thread_id)
         if not thread:
             continue
-        # Display only title, hide internal thread_key and thread_id from user
-        label = thread.get('title', 'Untitled')
+        # If title is empty, show a default Chat N label to user
+        raw_title = str(thread.get('title') or "").strip()
+        label = raw_title if raw_title else f"Chat {idx + 1}"
         choices.append((label, thread_id))
     return choices
 
@@ -1031,18 +1029,23 @@ def build_file_download_choices(thread: Dict[str, Any]) -> List[Tuple[str, str]]
 def download_file(
     state: Dict[str, Any],
     file_ref: str,
-) -> Optional[str]:
-    """Download selected file and return path for download."""
+) -> Optional[Tuple[str, str]]:
+    """Download selected file and return (path, filename) for Gradio File output."""
     if not file_ref or not state.get("active_id"):
         return None
-    
+
     thread = state["threads"].get(state["active_id"])
     if not thread:
         return None
-    
+
     try:
         file_path = materialize_thread_upload(thread, file_ref)
-        return file_path
+        if not file_path:
+            return None
+        filename = Path(file_path).name
+        if KB_ENABLE_TIMING_LOGS:
+            print(f"[DOWNLOAD] materialized '{file_ref}' -> {file_path}")
+        return (file_path, filename)
     except Exception as e:
         print(f"Error downloading file: {e}")
         return None
@@ -1063,18 +1066,21 @@ def render_uploaded_files_html(thread: Dict[str, Any]) -> str:
         size_text = format_bytes(int(item.get("size_bytes", 0) or 0))
         asset_id = item.get("asset_id", "")
         file_ref = asset_id or name
-        
-        cards.append(
-            "<div class='file-chip' data-file-ref='" + html.escape(file_ref) + "' data-file-name='" + html.escape(name) + "'>"
-            "<div class='file-chip-info'>"
-            f"<strong>{html.escape(name)}</strong>"
-            f"<small>{html.escape(size_text)}</small>"
-            "</div>"
-            "<div class='file-chip-actions'>"
-            f"<button class='file-action-btn download' type='button' title='Download'>⬇️</button>"
-            "</div>"
-            "</div>"
+        chip = []
+        chip.append("<div class='file-chip' data-file-ref='" + html.escape(file_ref) + "' data-file-name='" + html.escape(name) + "'>")
+        chip.append("<div class='file-chip-info'>")
+        chip.append(f"<strong>{html.escape(name)}</strong>")
+        chip.append(f"<small>{html.escape(size_text)}</small>")
+        chip.append("</div>")
+        # Inline download icon: sets hidden trigger textbox `file_download_trigger` so backend handles materialization
+        chip.append("<div class='file-chip-actions'>")
+        chip.append(
+            "<button class='file-action-btn download' type='button' title='Download' "
+            "onclick=\"(function(btn){var chip=btn.closest('.file-chip');var ref=chip && chip.dataset && chip.dataset.fileRef;var t=document.getElementById('file_download_trigger'); if(t && ref){t.value=ref; t.dispatchEvent(new Event('input',{bubbles:true}));}})(this)\">⬇️</button>"
         )
+        chip.append("</div>")
+        chip.append("</div>")
+        cards.append("".join(chip))
 
     html_content = f"<div class='sidebar-card'><div class='file-history'>{''.join(cards)}</div></div>"
     
@@ -1087,8 +1093,8 @@ def get_thread_payload(
     # Determine title input visibility (show if no normalized title)
     title_text = str(thread.get("title", "") or "")
     title_visible = not bool(normalize_text_block(title_text))
-    files_exist = bool(thread.get("uploaded_files"))
 
+    # Initialize hidden trigger to None and file output to None
     return (
         render_messages(thread.get("messages", [])),
         thread.get("code", ""),
@@ -1098,9 +1104,9 @@ def get_thread_payload(
         build_image_history_gallery(thread),
         render_uploaded_files_html(thread),
         thread.get("error", ""),
-        gr.update(choices=build_file_download_choices(thread), value=None, visible=files_exist),
-        gr.update(visible=title_visible, value=title_text),
-        gr.update(visible=files_exist),
+        gr.update(value=None),  # file_download_trigger (cleared)
+        gr.update(visible=title_visible, value=title_text),  # new_title_input
+        gr.update(value=None),  # file_download_output (no file yet)
     )
 
 
@@ -1125,7 +1131,19 @@ def select_thread(
     state["active_id"] = thread_id
     thread = state["threads"][thread_id]
     
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices, new_title_update, file_download_btn_update = get_thread_payload(thread)
+    (
+        messages,
+        code,
+        code_status,
+        exec_output,
+        exec_image,
+        image_gallery,
+        file_html,
+        error,
+        file_download_trigger_update,
+        new_title_update,
+        file_download_output_update,
+    ) = get_thread_payload(thread)
 
     return (
         state,
@@ -1140,9 +1158,9 @@ def select_thread(
         error,
         "",
         gr.update(value=None),
-        file_download_choices,
         new_title_update,
-        file_download_btn_update,
+        file_download_trigger_update,
+        file_download_output_update,
     )
 
 
@@ -1190,7 +1208,19 @@ def new_thread(
     persist_thread_obj.start()
     
     # Return IMMEDIATELY - UI updates fast, DB saves in background
-    messages, code, code_status, exec_output, exec_image, image_gallery, file_html, error, file_download_choices, new_title_update, file_download_btn_update = get_thread_payload(thread)
+    (
+        messages,
+        code,
+        code_status,
+        exec_output,
+        exec_image,
+        image_gallery,
+        file_html,
+        error,
+        file_download_trigger_update,
+        new_title_update,
+        file_download_output_update,
+    ) = get_thread_payload(thread)
 
     return (
         state,
@@ -1205,9 +1235,9 @@ def new_thread(
         error,
         "",
         gr.update(value=None),
-        file_download_choices,
         new_title_update,
-        file_download_btn_update,
+        file_download_trigger_update,
+        file_download_output_update,
     )
 
 
@@ -1265,9 +1295,9 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            file_download_choices,
+            file_download_trigger_update,
             new_title_update,
-            file_download_btn_update,
+            file_download_output_update,
         ) = get_thread_payload(thread)
         return (
             state,
@@ -1282,9 +1312,9 @@ def handle_chat(
             error,
             "",
             gr.update(value=None),
-            file_download_choices,
             new_title_update,
-            file_download_btn_update,
+            file_download_trigger_update,
+            file_download_output_update,
         )
 
     saved_attachments, current_upload_blocks, attachment_parts, upload_error = process_uploaded_files(
@@ -1332,9 +1362,9 @@ def handle_chat(
             image_gallery,
             file_html,
             error,
-            file_download_choices,
+            file_download_trigger_update,
             new_title_update,
-            file_download_btn_update,
+            file_download_output_update,
         ) = get_thread_payload(thread)
         return (
             state,
@@ -1349,9 +1379,9 @@ def handle_chat(
             error,
             "",
             gr.update(value=None),
-            file_download_choices,
             new_title_update,
-            file_download_btn_update,
+            file_download_trigger_update,
+            file_download_output_update,
         )
 
     try:
@@ -1421,9 +1451,9 @@ def handle_chat(
         image_gallery,
         file_html,
         error,
-        file_download_choices,
+        file_download_trigger_update,
         new_title_update,
-        file_download_btn_update,
+        file_download_visible,
     ) = get_thread_payload(thread)
     return (
         state,
@@ -1438,9 +1468,9 @@ def handle_chat(
         error,
         "",
         gr.update(value=None),
-        file_download_choices,
-        new_title_update,
-        file_download_btn_update,
+           new_title_update,
+           file_download_trigger_update,
+           gr.update(visible=file_download_visible),
     )
 
 
@@ -1637,10 +1667,6 @@ def approve_code(
     )
 
 
-def set_page(page: str) -> Tuple[Any, Any]:
-    return gr.update(visible=(page == "Chat")), gr.update(visible=(page == "Model"))
-
-
 def load_app_state() -> Tuple[
     Dict[str, Any],
     gr.Dropdown,
@@ -1666,9 +1692,9 @@ def load_app_state() -> Tuple[
         image_gallery,
         file_html,
         error,
-        file_download_choices,
+        file_download_trigger_update,
         new_title_update,
-        file_download_btn_update,
+        file_download_output_update,
     ) = get_thread_payload(thread)
     thread["error"] = merge_errors(error, format_store_error())
     return (
@@ -1684,9 +1710,9 @@ def load_app_state() -> Tuple[
         thread["error"],
         "",
         gr.update(value=None),
-        file_download_choices,
         new_title_update,
-        file_download_btn_update,
+        file_download_trigger_update,
+        file_download_output_update,
     )
 
 
@@ -1742,56 +1768,47 @@ def debug_check_mongo() -> None:
     except Exception as exc:  # pragma: no cover - debug helper
         print(f"[DEBUG] MongoDB check error: {exc}")
 
+def build_chat_blocks() -> gr.Blocks:
+    with gr.Blocks(title="Data Visualize Chatbox - Chat") as chat_demo:
+        state = gr.State(init_state())
+        config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
 
-with gr.Blocks(title="Data Visualize Chatbox") as demo:
-    state = gr.State(init_state())
-    config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
+        with gr.Row():
+            with gr.Column(scale=1, min_width=280):
+                # navigator removed - single page UI (Chat) only
+                thread_list = gr.Dropdown(choices=[], label="Conversations")
+                new_chat_btn = gr.Button("➕ New conversation", scale=1)
 
-    with gr.Row():
-        with gr.Column(scale=1, min_width=280):
-            nav = gr.Radio(choices=["Chat", "Model"], value="Chat", label="Navigator")
-            thread_list = gr.Dropdown(choices=[], label="Conversations")
-            
-            new_chat_btn = gr.Button("➕ New conversation", scale=1)
-            
-            new_title_input = gr.Textbox(
-                label="Title for new conversation",
-                placeholder="Enter a title or leave empty for auto-generated name...",
-                interactive=True,
-                visible=False,
-                lines=1,
-            )
+                new_title_input = gr.Textbox(
+                    label="Title for new conversation",
+                    placeholder="Enter a title or leave empty for auto-generated name...",
+                    interactive=True,
+                    visible=False,
+                    lines=1,
+                )
 
-            gr.Markdown("### Chart history")
-            image_history = gr.Gallery(
-                label="Generated images",
-                columns=2,
-                height=250,
-                object_fit="contain",
-                elem_classes=["image-history-grid"],
-            )
+                gr.Markdown("### Chart history")
+                image_history = gr.Gallery(
+                    label="Generated images",
+                    columns=2,
+                    height=250,
+                    object_fit="contain",
+                    elem_classes=["image-history-grid"],
+                )
 
-            gr.Markdown("### Uploaded files")
-            file_history = gr.HTML(render_uploaded_files_html(build_thread("Chat 1", 0)))
-            
-            file_download_trigger = gr.Textbox(visible=False, interactive=False)
-            file_download_select = gr.Dropdown(
-                label="Select file to download",
-                choices=[],
-                interactive=True,
-                visible=False,
-            )
-            file_download_btn = gr.Button("📥 Download", visible=False, scale=1)
-            
-            file_download_output = gr.File(label="Downloaded file", interactive=False)
+                gr.Markdown("### Uploaded files")
+                file_history = gr.HTML(render_uploaded_files_html(build_thread("", 0)))
 
-            mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
-            mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
-            mongo_db_name = gr.Textbox(value=DEFAULT_MONGODB_DB_NAME, visible=False)
-            mongo_collection_name = gr.Textbox(value=DEFAULT_MONGODB_COLLECTION_NAME, visible=False)
+                # Hidden trigger textbox used by inline icon clicks (elem_id ensures predictable DOM id)
+                file_download_trigger = gr.Textbox(visible=False, interactive=True, elem_id="file_download_trigger")
+                file_download_output = gr.File(label="Downloaded file", interactive=False)
 
-        with gr.Column(scale=4):
-            with gr.Group(visible=True) as chat_page:
+                mongo_uri_template = gr.Textbox(value=DEFAULT_MONGODB_URI_TEMPLATE, visible=False)
+                mongo_password = gr.Textbox(value=DEFAULT_MONGODB_PASSWORD, visible=False)
+                mongo_db_name = gr.Textbox(value=DEFAULT_MONGODB_DB_NAME, visible=False)
+                mongo_collection_name = gr.Textbox(value=DEFAULT_MONGODB_COLLECTION_NAME, visible=False)
+
+            with gr.Column(scale=4):
                 chatbot = gr.Chatbot(label="Chat")
                 with gr.Row():
                     message = gr.Textbox(label="Message", scale=4, placeholder="Đặt câu hỏi về dữ liệu, file đã upload hoặc yêu cầu vẽ biểu đồ...")
@@ -1804,91 +1821,85 @@ with gr.Blocks(title="Data Visualize Chatbox") as demo:
                 exec_image = gr.Image(label="Latest chart / execution image")
                 error_box = gr.Textbox(label="Error", interactive=False, lines=4)
 
-            with gr.Group(visible=False) as model_page:
-                build_property_model_page()
+        # Wire up events and initial load
+        load_outputs = [
+            state,
+            thread_list,
+            chatbot,
+            code_box,
+            code_status,
+            exec_output,
+            exec_image,
+            image_history,
+            file_history,
+            error_box,
+            message,
+            upload_ctx,
+            new_title_input,
+            file_download_trigger,
+            file_download_output,
+        ]
+        # initial load will be wired when the Blocks is mounted
 
-    nav.change(fn=set_page, inputs=[nav], outputs=[chat_page, model_page])
+        # Navigation currently static; enable page toggling later if needed
+        # on load
+        # We'll call load_app_state when launching the interface via the outer scope
 
-    load_outputs = [
-        state,
-        thread_list,
-        chatbot,
-        code_box,
-        code_status,
-        exec_output,
-        exec_image,
-        image_history,
-        file_history,
-        error_box,
-        message,
-        upload_ctx,
-        file_download_select,
-        new_title_input,
-        file_download_btn,
-    ]
-    demo.load(fn=load_app_state, outputs=load_outputs)
+        thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
 
-    thread_list.change(fn=select_thread, inputs=[state, thread_list], outputs=load_outputs)
-    
-    # Create new chat and show title input immediately
-    def new_chat_btn_clicked(state_val):
-        result = new_thread(state_val, "")
-        # result structure: ... , file_download_choices, new_title_update, file_download_btn_update
-        # Force the title input to be visible and empty for the user to edit
-        return (*result[:-2], gr.update(visible=True, value=""), result[-1])
+        def new_chat_btn_clicked(state_val):
+            result = new_thread(state_val, "")
+            return (*result[:-2], gr.update(visible=True, value=""), result[-1])
 
-    new_chat_btn.click(
-        fn=new_chat_btn_clicked,
-        inputs=[state],
-        outputs=load_outputs,
-    )
-    
-    # Create new chat with title on Enter
-    def create_new_chat_with_title(state_val, title_input):
-        # preserve_title=True ensures we don't re-trim or alter user's manual title
-        result = new_thread(state_val, title_input, preserve_title=True)
+        new_chat_btn.click(fn=new_chat_btn_clicked, inputs=[state], outputs=load_outputs)
 
-        # result structure: ... , file_download_choices, new_title_update, file_download_btn_update
-        # Hide the input and show the exact entered title (trim only outer whitespace)
-        final_title = str(title_input).strip() if title_input else ""
-        return (*result[:-2], gr.update(visible=False, value=final_title), result[-1])
-    
-    new_title_input.submit(
-        fn=create_new_chat_with_title,
-        inputs=[state, new_title_input],
-        outputs=load_outputs,
-    )
+        def create_new_chat_with_title(state_val, title_input):
+            result = new_thread(state_val, title_input, preserve_title=True)
+            final_title = str(title_input).strip() if title_input else ""
+            # Ensure the thread title is set exactly as entered and persist it
+            try:
+                active_id = state_val.get("active_id")
+                if active_id and state_val.get("threads") and active_id in state_val["threads"]:
+                    state_val["threads"][active_id]["title"] = final_title
+                    # persist synchronously to ensure DB reflects the change
+                    try:
+                        persist_thread(state_val, active_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return (*result[:-2], gr.update(visible=False, value=final_title), result[-1])
 
-    chat_inputs = [
-        state,
-        config_state,
-        message,
-        upload_ctx,
-        mongo_uri_template,
-        mongo_password,
-        mongo_db_name,
-        mongo_collection_name,
-    ]
-    send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
-    message.submit(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
+        new_title_input.submit(fn=create_new_chat_with_title, inputs=[state, new_title_input], outputs=load_outputs)
 
-    file_download_btn.click(
-        fn=download_file,
-        inputs=[state, file_download_select],
-        outputs=file_download_output,
-    )
+        chat_inputs = [
+            state,
+            config_state,
+            message,
+            upload_ctx,
+            mongo_uri_template,
+            mongo_password,
+            mongo_db_name,
+            mongo_collection_name,
+        ]
+        send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
+        message.submit(fn=handle_chat, inputs=chat_inputs, outputs=load_outputs)
 
-    approve_btn.click(
-        fn=approve_code,
-        inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name],
-        outputs=[state, exec_output, exec_image, code_status, image_history, error_box],
-    )
+        # file_download_trigger change will call download_file
 
-    file_download_trigger.change(
-        fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None,
-        inputs=[file_download_trigger, state],
-        outputs=file_download_output,
-    )
+        approve_btn.click(fn=approve_code, inputs=[state, code_box, mongo_uri_template, mongo_password, mongo_db_name], outputs=[state, exec_output, exec_image, code_status, image_history, error_box])
+
+        file_download_trigger.change(fn=lambda file_ref, state_val: download_file(state_val, file_ref) if file_ref else None, inputs=[file_download_trigger, state], outputs=file_download_output)
+        # Load initial app state into the chat block when it mounts
+        chat_demo.load(fn=load_app_state, outputs=load_outputs)
+
+    return chat_demo
+
+
+def build_model_blocks() -> gr.Blocks:
+    with gr.Blocks(title="Data Visualize Chatbox - Model") as model_demo:
+        build_property_model_page()
+    return model_demo
 
 
 if __name__ == "__main__":
@@ -1904,4 +1915,7 @@ if __name__ == "__main__":
         if KB_ENABLE_TIMING_LOGS:
             print(f"[KB INIT] preload/connect error: {exc}")
     debug_check_mongo()
+    chat_demo = build_chat_blocks()
+    model_demo = build_model_blocks()
+    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbox")
     demo.launch(css=APP_CSS)

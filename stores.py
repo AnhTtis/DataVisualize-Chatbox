@@ -272,9 +272,20 @@ class FirebaseStore:
                 pass
 
         from pymongo import MongoClient
-
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-        client.admin.command("ping")
+        try:
+            # Prefer secondary for reads so downloads can succeed even if primary is temporarily unavailable
+            from pymongo.read_preferences import ReadPreference
+            client = MongoClient(uri, serverSelectionTimeoutMS=5000, read_preference=ReadPreference.SECONDARY_PREFERRED)
+            # Ping to surface connectivity errors, but allow operation to continue even if ping fails
+            try:
+                client.admin.command("ping")
+            except Exception as exc:
+                # record the last error but continue; read_preference may still allow reads
+                self.last_error = traceback.format_exc()
+                if KB_ENABLE_TIMING_LOGS:
+                    print(f"[MONGO MEDIA] ping warning: {exc}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to create MongoDB client: {exc}")
         self._mongo_media_client = client
         self._mongo_media_signature = signature
         return client, client[db_name]
@@ -347,6 +358,24 @@ class FirebaseStore:
         mongo_password: str = "",
         mongo_db_name: str = "",
     ) -> Optional[Dict[str, Any]]:
+        # Always write a local cache copy; prefer returning a Mongo-backed asset when possible,
+        # but fall back to a local-only asset if Mongo/GridFS is not available.
+        cache_dir = Path(__file__).resolve().parent / "media_cache"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        suffix = Path(filename or "").suffix or ""
+        asset_id = uuid4().hex
+        cache_name = f"{asset_id}{suffix}"
+        cache_path = cache_dir / cache_name
+        try:
+            cache_path.write_bytes(data)
+        except Exception:
+            # best-effort only
+            pass
+
         try:
             asset = self._save_media_to_mongo(
                 thread_id=thread_id,
@@ -361,13 +390,41 @@ class FirebaseStore:
                 db_name=mongo_db_name,
                 metadata=metadata,
             )
+            # attach local cache path for fallback
+            try:
+                asset_id = asset.get("asset_id", asset_id)
+                cache_name = f"{asset_id}{suffix}"
+                cache_path = cache_dir / cache_name
+                if not cache_path.exists():
+                    try:
+                        cache_path.write_bytes(data)
+                    except Exception:
+                        pass
+                asset["local_cache_path"] = str(cache_path)
+            except Exception:
+                pass
             self.last_error = ""
             return asset
         except Exception:
+            # Mongo/GridFS save failed: return a local-only asset so UI can still download
             self.last_error = traceback.format_exc()
             if KB_ENABLE_TIMING_LOGS:
                 print(self.last_error)
-            return None
+            fallback_asset = {
+                "asset_id": asset_id,
+                "name": Path(filename or "unnamed").name,
+                "kind": kind,
+                "source": source,
+                "content_type": content_type,
+                "size_bytes": len(data),
+                "storage_backend": "not-persisted",
+                "created_at": utc_now_iso(),
+                "metadata": {"local_path": str(cache_path)},
+                "local_cache_path": str(cache_path),
+            }
+            if metadata and isinstance(metadata, dict):
+                fallback_asset.update(metadata)
+            return fallback_asset
 
     def load_media_bytes(
         self,
@@ -383,15 +440,36 @@ class FirebaseStore:
                 if not gridfs_file_id:
                     raise RuntimeError("Missing GridFS file id.")
 
-                _, db = self._connect_mongo_media(mongo_uri_template, mongo_password, mongo_db_name)
-                from bson import ObjectId
-                from gridfs import GridFSBucket
+                # Try to connect and read from GridFS
+                try:
+                    _, db = self._connect_mongo_media(mongo_uri_template, mongo_password, mongo_db_name)
+                    from bson import ObjectId
+                    from gridfs import GridFSBucket
 
-                bucket = GridFSBucket(db, bucket_name="chat_media")
-                stream = bucket.open_download_stream(ObjectId(gridfs_file_id))
-                data = stream.read()
-                self.last_error = ""
-                return data
+                    bucket = GridFSBucket(db, bucket_name="chat_media")
+                    stream = bucket.open_download_stream(ObjectId(gridfs_file_id))
+                    data = stream.read()
+                    self.last_error = ""
+                    return data
+                except Exception as exc:
+                    # Record the error and fall back to local cache if available
+                    self.last_error = traceback.format_exc()
+                    if KB_ENABLE_TIMING_LOGS:
+                        print(f"[MONGO MEDIA] GridFS read failed: {exc}")
+
+                    # Fallback: local cache written at save time
+                    local_cache = (
+                        asset.get("local_cache_path")
+                        or (asset.get("metadata") or {}).get("local_path")
+                        or (asset.get("metadata") or {}).get("local_cache_path")
+                    )
+                    if local_cache and Path(local_cache).exists():
+                        try:
+                            return Path(local_cache).read_bytes()
+                        except Exception:
+                            pass
+                    # Do not re-raise; allow outer handler to return None
+                    return None
 
             raise RuntimeError("Unsupported media backend.")
         except Exception:
