@@ -988,7 +988,7 @@ def load_thread_file_value(thread: Dict[str, Any], file_ref: str) -> Any:
     return str(path)
 
 
-def load_asset_image(asset: Dict[str, Any]) -> Optional[Image.Image]:
+def materialize_asset_image_png(asset: Dict[str, Any]) -> Optional[str]:
     data = store.load_media_bytes(
         asset,
         mongo_uri_template=DEFAULT_MONGODB_URI_TEMPLATE,
@@ -998,9 +998,12 @@ def load_asset_image(asset: Dict[str, Any]) -> Optional[Image.Image]:
     if data is None:
         return None
     try:
-        image = Image.open(io.BytesIO(data))
-        image.load()
-        return image
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            image.save(temp_file.name, format="PNG")
+            temp_file.close()
+            return temp_file.name
     except Exception:
         return None
 
@@ -1008,11 +1011,11 @@ def load_asset_image(asset: Dict[str, Any]) -> Optional[Image.Image]:
 def build_image_history_gallery(thread: Dict[str, Any]) -> List[Tuple[Any, str]]:
     gallery: List[Tuple[Any, str]] = []
     for asset in thread.get("image_history", []):
-        image = load_asset_image(asset)
-        if image is None:
+        image_path = materialize_asset_image_png(asset)
+        if image_path is None:
             continue
         caption = asset.get("name", "chart.png")
-        gallery.append((image, caption))
+        gallery.append((image_path, caption))
     return gallery
 
 
@@ -1021,9 +1024,9 @@ def get_current_exec_image(thread: Dict[str, Any]) -> Optional[Any]:
     if asset_id:
         for asset in reversed(thread.get("image_history", [])):
             if asset.get("asset_id") == asset_id:
-                image = load_asset_image(asset)
-                if image is not None:
-                    return image
+                image_path = materialize_asset_image_png(asset)
+                if image_path is not None:
+                    return image_path
                 break
     temp_path = thread.get("exec_image_temp_path")
     if temp_path and Path(temp_path).exists():
@@ -1802,7 +1805,7 @@ def debug_check_mongo() -> None:
         print(f"[DEBUG] MongoDB check error: {exc}")
 
 def build_chat_blocks() -> gr.Blocks:
-    with gr.Blocks(title="Data Visualize Chatbox - Chat") as chat_demo:
+    with gr.Blocks(title="Data Visualize Chatbot - Chat") as chat_demo:
         state = gr.State(init_state())
         config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
 
@@ -1959,7 +1962,7 @@ def build_chat_blocks() -> gr.Blocks:
 
 
 def build_model_blocks() -> gr.Blocks:
-    with gr.Blocks(title="Data Visualize Chatbox - Model") as model_demo:
+    with gr.Blocks(title="Data Visualize Chatbot - Model") as model_demo:
         build_property_model_page()
     return model_demo
 
@@ -1979,5 +1982,5 @@ if __name__ == "__main__":
     debug_check_mongo()
     chat_demo = build_chat_blocks()
     model_demo = build_model_blocks()
-    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbox")
+    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbot")
     demo.launch(css=APP_CSS)
