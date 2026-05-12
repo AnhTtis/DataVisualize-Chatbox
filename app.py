@@ -1802,7 +1802,7 @@ def debug_check_mongo() -> None:
         print(f"[DEBUG] MongoDB check error: {exc}")
 
 def build_chat_blocks() -> gr.Blocks:
-    with gr.Blocks(title="Data Visualize Chatbox - Chat") as chat_demo:
+    with gr.Blocks(title="Data Visualize Chatbot - Chat") as chat_demo:
         state = gr.State(init_state())
         config_state = gr.State({"behavior": "", "model": DEFAULT_MODEL})
 
@@ -1959,7 +1959,7 @@ def build_chat_blocks() -> gr.Blocks:
 
 
 def build_model_blocks() -> gr.Blocks:
-    with gr.Blocks(title="Data Visualize Chatbox - Model") as model_demo:
+    with gr.Blocks(title="Data Visualize Chatbot - Model") as model_demo:
         build_property_model_page()
     return model_demo
 
@@ -1979,5 +1979,5 @@ if __name__ == "__main__":
     debug_check_mongo()
     chat_demo = build_chat_blocks()
     model_demo = build_model_blocks()
-    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbox")
+    demo = gr.TabbedInterface([chat_demo, model_demo], ["Chat", "Model"], title="Data Visualize Chatbot")
     demo.launch(css=APP_CSS)
